@@ -1356,8 +1356,8 @@ async def run_session(
         stderr_lines.append(line)
         log.debug(f"[session {session_num}] stderr: {line.rstrip()}")
 
-    # Build SDK options — prefer system isaac CLI over bundled (may be outdated)
-    system_cli = shutil.which("isaac")
+    # Build SDK options — prefer system claude CLI over bundled (may be outdated)
+    system_cli = shutil.which("claude") or shutil.which("isaac")
     opts_kwargs: dict = {
         "permission_mode": args.p,
         "system_prompt": {
@@ -1609,7 +1609,7 @@ async def run_checkpoint_session(
         f"- Do NOT continue implementing. Only checkpoint and stop.\n"
     )
 
-    system_cli = shutil.which("isaac")
+    system_cli = shutil.which("claude") or shutil.which("isaac")
     opts_kwargs: dict = {
         "permission_mode": args.p,
         "cwd": os.getcwd(),
@@ -1884,6 +1884,17 @@ async def async_main():
     # Strip Claude env vars so nested SDK sessions work
     os.environ.pop("CLAUDECODE", None)
     os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+
+    # ── Verify Claude CLI is available ──
+    cli_path = shutil.which("claude") or shutil.which("isaac")
+    if not cli_path:
+        print(
+            "Error: Claude Code CLI not found on PATH.\n"
+            "Install it: https://docs.anthropic.com/en/docs/claude-code\n"
+            "Then verify: claude --version",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # ── Banner ──
     print("╔══════════════════════════════════════════════╗")
