@@ -1,0 +1,13 @@
+{
+  "name": "relentless",
+  "description": "Auto-continuing Claude Code agent with TDD pipeline: PRD → gate tests → implementation → live validation → remediation. Features loop detection, cost tracking, adaptive tuning, and session timeouts.",
+  "version": "1.5.6",
+  "keywords": ["tdd", "pipeline", "automation", "implementation", "validation", "devloop", "autoresearch"],
+  "author": {
+    "name": "David O'Keeffe",
+    "url": "https://github.com/dgokeeffe"
+  },
+  "repository": "https://github.com/dgokeeffe/relentless",
+  "license": "MIT",
+  "skills": "./skills/"
+}

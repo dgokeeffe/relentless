@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+*.log
+_relentless_state.md
+_relentless_config.json
+_relentless_handoff.json
+_validation_report.json
+_gates.json
+_orchestration_state.md
+_prd_brief_*.md
+.relentless_logs/
+autoresearch-*/
+*.baseline

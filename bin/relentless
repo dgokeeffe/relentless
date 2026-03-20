@@ -1,0 +1,2173 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "claude-agent-sdk>=0.1.37",
+# ]
+# ///
+"""relentless — auto-continuing Claude Code agent with real-time loop detection
+
+Uses the Claude Agent SDK for direct tool-call visibility, native loop detection,
+graceful interrupt, and cost tracking — while retaining access to ALL Claude Code
+tools, skills, and MCP servers.
+
+Usage:
+  relentless "Refactor the auth module to use JWT tokens"
+  relentless -f task.md
+  relentless -n 8 -m opus "Build the feature described in PRD.md"
+  echo "Fix all lint errors" | relentless
+
+Options:
+  -n NUM     Max sessions (default: 5)
+  -b USD     Max budget per session in USD (default: no limit)
+  -m MODEL   Model to use (default: system default)
+  -d DIR     Working directory (default: current)
+  -f FILE    Read task description from file
+  -p MODE    Permission mode: default, acceptEdits, plan, auto, bypassPermissions (default: auto)
+  -s FILE    State file path (default: ./_relentless_state.md)
+  -t MINS    Timeout per session in minutes (default: 30)
+  -v         Verbose — show all tool calls and messages
+  -c         Continue from existing state file
+  --dry-run  Print the prompt that would be sent without running
+  --max-turns N       Max assistant turns per session before handoff (default: 50)
+  --context-chars N   Estimated char budget per session (default: 480000)
+  --handoff-file FILE JSON handoff path (default: alongside state file)
+  --handoff-max-bytes N  Max handoff JSON bytes (default: 8192)
+  --failure-repeat-limit N  Same failing tool-result signature N times → loop
+  --adaptive/--no-adaptive  Enable/disable adaptive tuning from run history
+  --adaptive-profile MODE   conservative | balanced | aggressive (default: balanced)
+  --self-test        Run internal detector/tuning self-tests and exit
+  --no-checkpoint     Skip checkpoint micro-session on context handoff
+"""
+
+import argparse
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ResultMessage,
+    UserMessage,
+    query,
+)
+from claude_agent_sdk.types import TextBlock, ToolUseBlock
+
+# ── Constants ──────────────────────────────────────────────────
+
+STUCK_THRESHOLD = 2        # escalate after N sessions with identical state hash
+TOOL_REPEAT_LIMIT = 3      # same (tool, input_hash) N times in one session → loop
+SESSION_STALL_SECS = 300   # 5 min with no messages → stall
+MAX_TOOL_CALLS_PER_SESSION = 200  # safety cap per session
+FAILURE_REPEAT_LIMIT = 3          # same failing tool-result signature N times → loop
+DEFAULT_MAX_TURNS = 50            # assistant turns per session before handoff
+DEFAULT_CONTEXT_CHARS = 480_000   # ~120K tokens at ~4 chars/token
+CONTEXT_SOFT_PCT = 0.75           # log warning (fraction of budget)
+CONTEXT_HARD_PCT = 0.90           # force graceful handoff (fraction of budget)
+ADAPTIVE_HISTORY_LOOKBACK = 5
+RUN_HISTORY_FILENAME = "run_history.jsonl"
+RUN_JOURNAL_FILENAME = "run_journal.jsonl"
+MODEL_USAGE_FILENAME = "model_usage.json"
+ADAPTIVE_PROFILE_DEFAULT = "balanced"
+DEFAULT_HANDOFF_FILENAME = "_relentless_handoff.json"
+HANDOFF_SCHEMA_VERSION = "1.0"
+HANDOFF_MAX_BYTES = 8_192
+HANDOFF_LIST_LIMIT = 8
+HANDOFF_TEXT_LIMIT = 220
+HANDOFF_SUMMARY_LIMIT = 900
+ADAPTIVE_PROFILES: dict[str, dict[str, int]] = {
+    "conservative": {
+        "min_failed_runs": 3,
+        "sessions_bump": 1,
+        "max_sessions_cap": 8,
+        "loop_events_threshold": 3,
+        "stall_events_threshold": 3,
+        "context_events_threshold": 6,
+        "tool_repeat_bump": 1,
+        "tool_repeat_cap": 5,
+        "max_tool_calls_bump": 25,
+        "max_tool_calls_cap": 300,
+        "timeout_bump": 5,
+        "timeout_cap": 60,
+        "max_turns_bump": 5,
+        "max_turns_cap": 90,
+    },
+    "balanced": {
+        "min_failed_runs": 2,
+        "sessions_bump": 2,
+        "max_sessions_cap": 12,
+        "loop_events_threshold": 2,
+        "stall_events_threshold": 2,
+        "context_events_threshold": 4,
+        "tool_repeat_bump": 1,
+        "tool_repeat_cap": 6,
+        "max_tool_calls_bump": 50,
+        "max_tool_calls_cap": 500,
+        "timeout_bump": 10,
+        "timeout_cap": 90,
+        "max_turns_bump": 10,
+        "max_turns_cap": 120,
+    },
+    "aggressive": {
+        "min_failed_runs": 2,
+        "sessions_bump": 3,
+        "max_sessions_cap": 16,
+        "loop_events_threshold": 1,
+        "stall_events_threshold": 1,
+        "context_events_threshold": 2,
+        "tool_repeat_bump": 2,
+        "tool_repeat_cap": 8,
+        "max_tool_calls_bump": 100,
+        "max_tool_calls_cap": 800,
+        "timeout_bump": 20,
+        "timeout_cap": 120,
+        "max_turns_bump": 20,
+        "max_turns_cap": 160,
+    },
+}
+FAILURE_MARKERS = (
+    "error",
+    "exception",
+    "traceback",
+    "failed",
+    "[exit code",
+    "timeout",
+    "permissiondenied",
+)
+
+log = logging.getLogger("relentless")
+
+
+# ── Logging Setup ──────────────────────────────────────────────
+
+def setup_logging(log_dir: Path, verbose: bool) -> Path:
+    log_dir.mkdir(exist_ok=True)
+
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO if verbose else logging.WARNING)
+    console.setFormatter(logging.Formatter("%(message)s"))
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    master_log = log_dir / f"relentless_{ts}.log"
+    fh = logging.FileHandler(master_log)
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
+    )
+
+    log.setLevel(logging.DEBUG)
+    log.addHandler(console)
+    log.addHandler(fh)
+    return master_log
+
+
+# ── State Hash Tracking (cross-session loop guard) ────────────
+
+class StateTracker:
+    """Detect agent loops by hashing state file content across sessions."""
+
+    def __init__(self, state_file: Path, stuck_threshold: int = STUCK_THRESHOLD):
+        self.state_file = state_file
+        self.stuck_threshold = stuck_threshold
+        self.hashes: list[tuple[int, str]] = []  # (session_num, hash)
+
+    def compute_hash(self) -> str:
+        if not self.state_file.exists():
+            return "no_state_file"
+        content = self.state_file.read_text()
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        return hashlib.md5("\n".join(lines).encode()).hexdigest()
+
+    def record(self, session_num: int) -> str:
+        h = self.compute_hash()
+        self.hashes.append((session_num, h))
+        log.debug(f"State hash after session {session_num}: {h}")
+        return h
+
+    def is_stuck(self) -> tuple[bool, str]:
+        if len(self.hashes) < self.stuck_threshold:
+            return False, ""
+        recent = [h for _, h in self.hashes[-self.stuck_threshold:]]
+        if len(set(recent)) == 1 and recent[0] != "no_state_file":
+            sessions = [s for s, _ in self.hashes[-self.stuck_threshold:]]
+            msg = (
+                f"Identical state across sessions {sessions} "
+                f"(hash: {recent[0][:12]}...). Agent is repeating without progress."
+            )
+            return True, msg
+        return False, ""
+
+
+# ── Intra-session Tool Loop Detector ──────────────────────────
+
+class ToolLoopDetector:
+    """Track (tool_name, hash(input)) pairs within a session to detect loops."""
+
+    def __init__(self, repeat_limit: int = TOOL_REPEAT_LIMIT):
+        self.repeat_limit = repeat_limit
+        self.calls: dict[str, int] = {}  # "tool:input_hash" → count
+        self.audit_trail: list[dict] = []
+        self.total_calls = 0
+
+    def record(self, tool_name: str, tool_input: dict) -> tuple[bool, str]:
+        """Record a tool call. Returns (is_loop, description)."""
+        self.total_calls += 1
+        input_hash = hashlib.md5(
+            json.dumps(tool_input, sort_keys=True, default=str).encode()
+        ).hexdigest()[:12]
+        key = f"{tool_name}:{input_hash}"
+
+        self.calls[key] = self.calls.get(key, 0) + 1
+        count = self.calls[key]
+
+        self.audit_trail.append({
+            "seq": self.total_calls,
+            "tool": tool_name,
+            "input_hash": input_hash,
+            "repeat_count": count,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+        if count >= self.repeat_limit:
+            desc = (
+                f"Tool '{tool_name}' called {count} times with same input "
+                f"(hash: {input_hash})"
+            )
+            return True, desc
+        return False, ""
+
+
+# ── Context Budget Tracker (graceful handoff) ────────────────
+
+class ContextBudget:
+    """Track estimated context consumption for graceful session handoff.
+
+    Uses two heuristics (whichever triggers first):
+    1. Turn count — each AssistantMessage is one turn; predictable context cost
+    2. Character accumulation — catches cases where few turns carry huge payloads
+       (e.g. large file reads in tool results)
+
+    At CONTEXT_SOFT_PCT, logs a warning.
+    At CONTEXT_HARD_PCT, signals the session to stop so the outer loop can
+    hand off to a fresh session with the state file.
+    """
+
+    def __init__(
+        self,
+        max_turns: int = DEFAULT_MAX_TURNS,
+        max_chars: int = DEFAULT_CONTEXT_CHARS,
+        soft_pct: float = CONTEXT_SOFT_PCT,
+        hard_pct: float = CONTEXT_HARD_PCT,
+    ):
+        self.max_turns = max_turns
+        self.max_chars = max_chars
+        self.soft_pct = soft_pct
+        self.hard_pct = hard_pct
+        self.turn_count = 0
+        self.char_count = 0
+        self._soft_warned = False
+
+    def record_message(self, message) -> None:
+        """Accumulate estimated token cost from a streamed message."""
+        if isinstance(message, AssistantMessage):
+            self.turn_count += 1
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    self.char_count += len(block.text)
+                elif isinstance(block, ToolUseBlock):
+                    self.char_count += len(json.dumps(block.input, default=str))
+        elif isinstance(message, UserMessage):
+            # Tool results can be enormous (file reads, search results).
+            # Serialize defensively — SDK versions may differ.
+            try:
+                self.char_count += len(str(message.content))
+            except Exception:
+                pass
+
+    @property
+    def utilization(self) -> float:
+        """Max of turn-based and char-based utilization (0.0 – 1.0+)."""
+        turn_pct = self.turn_count / self.max_turns if self.max_turns > 0 else 0
+        char_pct = self.char_count / self.max_chars if self.max_chars > 0 else 0
+        return max(turn_pct, char_pct)
+
+    def should_warn(self) -> bool:
+        if self._soft_warned:
+            return False
+        if self.utilization >= self.soft_pct:
+            self._soft_warned = True
+            return True
+        return False
+
+    def should_stop(self) -> bool:
+        return self.utilization >= self.hard_pct
+
+    def status(self) -> str:
+        turn_pct = (self.turn_count / self.max_turns * 100) if self.max_turns else 0
+        char_pct = (self.char_count / self.max_chars * 100) if self.max_chars else 0
+        return (
+            f"turns={self.turn_count}/{self.max_turns} ({turn_pct:.0f}%) "
+            f"chars≈{self.char_count:,}/{self.max_chars:,} ({char_pct:.0f}%)"
+        )
+
+
+# ── Repeated Failure Signature Detector ────────────────────────
+
+class FailureSignatureDetector:
+    """Detect repeated failing tool-result signatures within a session."""
+
+    def __init__(self, repeat_limit: int = FAILURE_REPEAT_LIMIT):
+        self.repeat_limit = repeat_limit
+        self.last_signature = ""
+        self.consecutive = 0
+
+    def _extract_signature(self, text: str) -> str:
+        lines: list[str] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            lowered = line.lower()
+            if any(marker in lowered for marker in FAILURE_MARKERS):
+                lines.append(line[:220])
+            if len(lines) >= 3:
+                break
+        return " | ".join(lines)
+
+    def record(self, text: str) -> tuple[bool, str]:
+        signature = self._extract_signature(text)
+        if not signature:
+            self.last_signature = ""
+            self.consecutive = 0
+            return False, ""
+
+        if signature == self.last_signature:
+            self.consecutive += 1
+        else:
+            self.last_signature = signature
+            self.consecutive = 1
+
+        if self.consecutive >= self.repeat_limit:
+            return True, f"Repeated failing tool result {self.consecutive}x: {signature[:180]}"
+        return False, ""
+
+
+# ── Adaptive Memory and Tuning ─────────────────────────────────
+
+def _flag_used(cli_args: list[str], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in cli_args)
+
+
+def compute_task_hash(task: str) -> str:
+    return hashlib.sha256(task.encode("utf-8")).hexdigest()[:16]
+
+
+def _adaptive_profile_config(profile: str) -> dict[str, int]:
+    return ADAPTIVE_PROFILES.get(profile, ADAPTIVE_PROFILES[ADAPTIVE_PROFILE_DEFAULT])
+
+
+def load_recent_run_history(log_dir: Path, task_hash: str, limit: int = ADAPTIVE_HISTORY_LOOKBACK) -> list[dict]:
+    history_path = log_dir / RUN_HISTORY_FILENAME
+    if not history_path.exists():
+        return []
+
+    records: list[dict] = []
+    try:
+        for line in reversed(history_path.read_text().splitlines()):
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("task_hash") != task_hash:
+                continue
+            records.append(payload)
+            if len(records) >= limit:
+                break
+    except Exception:
+        log.debug("Failed reading adaptive run history", exc_info=True)
+    return records
+
+
+def append_run_history(log_dir: Path, payload: dict) -> None:
+    history_path = log_dir / RUN_HISTORY_FILENAME
+    try:
+        with history_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, sort_keys=True) + "\n")
+    except Exception:
+        log.debug("Failed writing adaptive run history", exc_info=True)
+
+
+def load_last_success_model(log_dir: Path) -> str:
+    model_path = log_dir / MODEL_USAGE_FILENAME
+    if not model_path.exists():
+        return ""
+    try:
+        payload = json.loads(model_path.read_text())
+    except Exception:
+        log.debug("Failed reading model memory file", exc_info=True)
+        return ""
+    if isinstance(payload, dict):
+        model = payload.get("last_success_model")
+        if isinstance(model, str):
+            return model
+    return ""
+
+
+def save_last_success_model(log_dir: Path, model_name: str) -> None:
+    if not model_name:
+        return
+
+    model_path = log_dir / MODEL_USAGE_FILENAME
+    payload: dict = {}
+    if model_path.exists():
+        try:
+            existing = json.loads(model_path.read_text())
+            if isinstance(existing, dict):
+                payload = existing
+        except Exception:
+            log.debug("Failed parsing model memory file", exc_info=True)
+
+    counts = payload.get("success_model_counts", {})
+    if not isinstance(counts, dict):
+        counts = {}
+    counts[model_name] = int(counts.get(model_name, 0)) + 1
+
+    payload["last_success_model"] = model_name
+    payload["success_model_counts"] = counts
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        model_path.write_text(json.dumps(payload, indent=2))
+    except Exception:
+        log.debug("Failed writing model memory file", exc_info=True)
+
+
+def apply_adaptive_overrides(
+    args: argparse.Namespace,
+    log_dir: Path,
+    task_hash: str,
+    cli_args: list[str],
+    profile: str,
+) -> list[str]:
+    notes: list[str] = []
+    cfg = _adaptive_profile_config(profile)
+    history = load_recent_run_history(log_dir, task_hash, limit=ADAPTIVE_HISTORY_LOOKBACK)
+    if not history:
+        return notes
+
+    if not args.m and not _flag_used(cli_args, "-m"):
+        remembered_model = load_last_success_model(log_dir)
+        if remembered_model:
+            args.m = remembered_model
+            notes.append(f"model= {remembered_model} (from last successful run)")
+
+    failed_runs = [r for r in history if int(r.get("exit_code", 1)) != 0]
+    if len(failed_runs) < int(cfg["min_failed_runs"]):
+        return notes
+
+    recent_failures = failed_runs[:2]
+
+    if (
+        not _flag_used(cli_args, "-n")
+        and all(
+            str(r.get("final_reason", "")) in ("max_sessions", "max_sessions_exhausted")
+            for r in recent_failures
+        )
+    ):
+        old = args.n
+        args.n = min(args.n + int(cfg["sessions_bump"]), int(cfg["max_sessions_cap"]))
+        if args.n != old:
+            notes.append(f"sessions= {old}->{args.n} (recent runs exhausted max sessions)")
+
+    loop_events = 0
+    stall_events = 0
+    context_events = 0
+    for run in failed_runs[:3]:
+        counts = run.get("stop_reason_counts", {})
+        if not isinstance(counts, dict):
+            continue
+        loop_events += int(counts.get("loop_detected", 0))
+        stall_events += int(counts.get("stall", 0))
+        context_events += int(counts.get("context_limit", 0))
+
+    if loop_events >= int(cfg["loop_events_threshold"]):
+        if not _flag_used(cli_args, "--tool-repeat-limit"):
+            old = args.tool_repeat_limit
+            args.tool_repeat_limit = min(
+                args.tool_repeat_limit + int(cfg["tool_repeat_bump"]),
+                int(cfg["tool_repeat_cap"]),
+            )
+            if args.tool_repeat_limit != old:
+                notes.append(
+                    f"tool_repeat_limit= {old}->{args.tool_repeat_limit} "
+                    "(recent loop detections)"
+                )
+        if not _flag_used(cli_args, "--max-tool-calls"):
+            old = args.max_tool_calls
+            args.max_tool_calls = min(
+                args.max_tool_calls + int(cfg["max_tool_calls_bump"]),
+                int(cfg["max_tool_calls_cap"]),
+            )
+            if args.max_tool_calls != old:
+                notes.append(
+                    f"max_tool_calls= {old}->{args.max_tool_calls} "
+                    "(recent loop detections)"
+                )
+
+    if stall_events >= int(cfg["stall_events_threshold"]) and not _flag_used(cli_args, "-t"):
+        old = args.t
+        args.t = min(args.t + int(cfg["timeout_bump"]), int(cfg["timeout_cap"]))
+        if args.t != old:
+            notes.append(f"timeout= {old}m->{args.t}m (recent stalled sessions)")
+
+    if context_events >= int(cfg["context_events_threshold"]) and not _flag_used(cli_args, "--max-turns"):
+        old = args.max_turns
+        args.max_turns = min(args.max_turns + int(cfg["max_turns_bump"]), int(cfg["max_turns_cap"]))
+        if args.max_turns != old:
+            notes.append(
+                f"max_turns= {old}->{args.max_turns} (frequent context handoffs)"
+            )
+
+    return notes
+
+
+# ── Handoff Contract + Session Journal ─────────────────────────
+
+def append_run_journal(log_dir: Path, payload: dict) -> None:
+    journal_path = log_dir / RUN_JOURNAL_FILENAME
+    try:
+        with journal_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, sort_keys=True) + "\n")
+    except Exception:
+        log.debug("Failed writing run journal", exc_info=True)
+
+
+def default_handoff_file_for_state(state_file: Path) -> Path:
+    return state_file.with_name(DEFAULT_HANDOFF_FILENAME)
+
+
+def _trim_text(value: object, limit: int = HANDOFF_TEXT_LIMIT) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _trim_items(value: object, list_limit: int = HANDOFF_LIST_LIMIT, text_limit: int = HANDOFF_TEXT_LIMIT) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for raw in value:
+        t = _trim_text(raw, text_limit)
+        if t:
+            items.append(t)
+        if len(items) >= list_limit:
+            break
+    return items
+
+
+def extract_acceptance_criteria(task: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"\bAC-\d+\b", task, flags=re.IGNORECASE):
+        ac = match.group(0).upper()
+        if ac not in seen:
+            seen.add(ac)
+            out.append(ac)
+    return out
+
+
+def _clean_state_line(line: str) -> str:
+    cleaned = line.strip()
+    cleaned = re.sub(r"^[-*]\s+", "", cleaned)
+    return cleaned.strip()
+
+
+def parse_state_sections(state_text: str) -> dict[str, object]:
+    sections: dict[str, object] = {
+        "status": "",
+        "completed": [],
+        "in_progress": [],
+        "discoveries": [],
+        "remaining": [],
+        "blockers": [],
+    }
+
+    current: str | None = None
+    heading_map = {
+        "completed": "completed",
+        "in progress": "in_progress",
+        "discoveries": "discoveries",
+        "remaining": "remaining",
+        "blockers": "blockers",
+    }
+    for raw in state_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        upper = line.upper()
+        if upper.startswith("STATUS:"):
+            sections["status"] = line.split(":", 1)[1].strip().upper()
+            continue
+        if line.startswith("## "):
+            key = heading_map.get(line[3:].strip().lower())
+            current = key
+            continue
+        if current:
+            cleaned = _clean_state_line(line)
+            if cleaned:
+                casted = sections.get(current)
+                if isinstance(casted, list):
+                    casted.append(cleaned)
+    return sections
+
+
+def _remaining_acs_from_done(ac_ids: list[str], done_items: list[str]) -> list[str]:
+    if not ac_ids:
+        return []
+    done_blob = "\n".join(done_items).upper()
+    return [ac for ac in ac_ids if ac not in done_blob]
+
+
+def _enforce_handoff_size(payload: dict, max_bytes: int) -> dict:
+    cap = max(1024, max_bytes)
+    while len(json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")) > cap:
+        trimmed = False
+        for key in ("artifact_refs", "discoveries", "done", "blockers", "remaining_acs"):
+            values = payload.get(key)
+            if isinstance(values, list) and len(values) > 1:
+                values.pop()
+                trimmed = True
+                break
+        if trimmed:
+            continue
+        for key in ("summary", "next_step", "in_flight"):
+            value = str(payload.get(key, ""))
+            if len(value) > 120:
+                payload[key] = value[:117].rstrip() + "..."
+                trimmed = True
+                break
+        if not trimmed:
+            payload["summary"] = _trim_text(payload.get("summary", ""), 120)
+            break
+    return payload
+
+
+def normalize_handoff_payload(
+    payload: object,
+    *,
+    task: str,
+    session_num: int,
+    ac_ids: list[str],
+    max_bytes: int,
+) -> dict:
+    data = payload if isinstance(payload, dict) else {}
+
+    done = _trim_items(data.get("done"), list_limit=HANDOFF_LIST_LIMIT)
+    discoveries = _trim_items(data.get("discoveries"), list_limit=HANDOFF_LIST_LIMIT)
+    blockers = _trim_items(data.get("blockers"), list_limit=HANDOFF_LIST_LIMIT)
+    artifact_refs = _trim_items(data.get("artifact_refs"), list_limit=HANDOFF_LIST_LIMIT)
+
+    in_flight = _trim_text(data.get("in_flight"), HANDOFF_TEXT_LIMIT)
+    next_step = _trim_text(data.get("next_step"), HANDOFF_TEXT_LIMIT)
+    summary = _trim_text(data.get("summary"), HANDOFF_SUMMARY_LIMIT)
+
+    success = bool(data.get("success", False))
+    is_continue = bool(data.get("is_continue", not success))
+    if success:
+        is_continue = False
+
+    goal_default = _trim_text(next((ln.strip() for ln in task.splitlines() if ln.strip()), "Complete the requested task."), HANDOFF_TEXT_LIMIT)
+    goal = _trim_text(data.get("goal") or goal_default, HANDOFF_TEXT_LIMIT)
+
+    if not summary:
+        if success:
+            summary = "Completed required work and marked run successful."
+        elif next_step:
+            summary = f"Continue with next step: {next_step}"
+        elif in_flight:
+            summary = f"In progress: {in_flight}"
+        else:
+            summary = "Continue implementation using state and remaining acceptance criteria."
+
+    remaining_acs = _trim_items(data.get("remaining_acs"), list_limit=HANDOFF_LIST_LIMIT)
+    if not remaining_acs:
+        remaining_acs = _remaining_acs_from_done(ac_ids, done)
+    if ac_ids:
+        allowed = {ac.upper() for ac in ac_ids}
+        remaining_acs = [ac for ac in remaining_acs if ac.upper() in allowed]
+        if not remaining_acs:
+            remaining_acs = _remaining_acs_from_done(ac_ids, done)
+
+    target_ac = _trim_text(data.get("target_ac"), 32).upper()
+    if ac_ids:
+        allowed = {ac.upper() for ac in ac_ids}
+        if target_ac not in allowed:
+            target_ac = remaining_acs[0] if remaining_acs else ac_ids[0]
+
+    normalized = {
+        "schema_version": HANDOFF_SCHEMA_VERSION,
+        "session": int(data.get("session") or session_num),
+        "goal": goal,
+        "success": bool(success),
+        "is_continue": bool(is_continue),
+        "summary": summary,
+        "done": done,
+        "in_flight": in_flight,
+        "next_step": next_step,
+        "discoveries": discoveries,
+        "blockers": blockers,
+        "artifact_refs": artifact_refs,
+        "target_ac": target_ac,
+        "remaining_acs": remaining_acs,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return _enforce_handoff_size(normalized, max_bytes=max_bytes)
+
+
+def validate_handoff_payload(payload: object, max_bytes: int) -> tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "handoff payload must be a JSON object"
+
+    required_bool = ("success", "is_continue")
+    required_str = ("goal", "summary", "in_flight", "next_step")
+    required_list = ("done", "discoveries", "blockers", "artifact_refs", "remaining_acs")
+
+    for key in required_bool:
+        if not isinstance(payload.get(key), bool):
+            return False, f"handoff.{key} must be boolean"
+    for key in required_str:
+        if not isinstance(payload.get(key), str):
+            return False, f"handoff.{key} must be string"
+    for key in required_list:
+        value = payload.get(key)
+        if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+            return False, f"handoff.{key} must be list[str]"
+
+    if payload.get("success") and payload.get("is_continue"):
+        return False, "handoff success=true requires is_continue=false"
+    if not payload.get("summary", "").strip():
+        return False, "handoff.summary cannot be empty"
+
+    encoded_size = len(json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+    if encoded_size > max(1024, max_bytes):
+        return False, f"handoff exceeds size cap ({encoded_size} bytes)"
+    return True, ""
+
+
+def read_handoff_payload(handoff_file: Path, max_bytes: int) -> tuple[dict | None, str]:
+    if not handoff_file.exists():
+        return None, "handoff file missing"
+    try:
+        payload = json.loads(handoff_file.read_text())
+    except Exception as exc:
+        return None, f"failed to parse handoff JSON: {exc}"
+
+    ok, reason = validate_handoff_payload(payload, max_bytes=max_bytes)
+    if not ok:
+        return None, reason
+    return payload, ""
+
+
+def write_handoff_payload(handoff_file: Path, payload: object, *, task: str, session_num: int, ac_ids: list[str], max_bytes: int) -> dict:
+    normalized = normalize_handoff_payload(
+        payload,
+        task=task,
+        session_num=session_num,
+        ac_ids=ac_ids,
+        max_bytes=max_bytes,
+    )
+    handoff_file.write_text(json.dumps(normalized, indent=2) + "\n")
+    return normalized
+
+
+def fallback_handoff_from_state(
+    *,
+    task: str,
+    state_file: Path,
+    handoff_file: Path,
+    session_num: int,
+    ac_ids: list[str],
+    max_bytes: int,
+    reason: str,
+) -> dict:
+    state_text = state_file.read_text() if state_file.exists() else ""
+    sections = parse_state_sections(state_text)
+    status = str(sections.get("status", ""))
+    completed = sections.get("completed", []) if isinstance(sections.get("completed"), list) else []
+    in_progress = sections.get("in_progress", []) if isinstance(sections.get("in_progress"), list) else []
+    discoveries = sections.get("discoveries", []) if isinstance(sections.get("discoveries"), list) else []
+    remaining = sections.get("remaining", []) if isinstance(sections.get("remaining"), list) else []
+    blockers = sections.get("blockers", []) if isinstance(sections.get("blockers"), list) else []
+
+    success = status == "COMPLETE"
+    next_step = remaining[0] if remaining else ""
+    in_flight = in_progress[0] if in_progress else ""
+    summary = f"{reason}. {'Complete' if success else 'Continue'} from state + handoff protocol."
+    payload = {
+        "schema_version": HANDOFF_SCHEMA_VERSION,
+        "session": session_num,
+        "goal": next((ln.strip() for ln in task.splitlines() if ln.strip()), "Complete the requested task."),
+        "success": success,
+        "is_continue": not success,
+        "summary": summary,
+        "done": completed,
+        "in_flight": in_flight,
+        "next_step": next_step,
+        "discoveries": discoveries,
+        "blockers": blockers,
+        "artifact_refs": [],
+        "target_ac": "",
+        "remaining_acs": [],
+    }
+    return write_handoff_payload(
+        handoff_file,
+        payload,
+        task=task,
+        session_num=session_num,
+        ac_ids=ac_ids,
+        max_bytes=max_bytes,
+    )
+
+
+def summarize_handoff_for_prompt(payload: dict | None) -> str:
+    if not payload:
+        return "(no prior handoff found)"
+    parts = []
+    target = str(payload.get("target_ac", "")).strip()
+    if target:
+        parts.append(f"target_ac={target}")
+    summary = _trim_text(payload.get("summary", ""), 180)
+    if summary:
+        parts.append(f"summary={summary}")
+    next_step = _trim_text(payload.get("next_step", ""), 140)
+    if next_step:
+        parts.append(f"next_step={next_step}")
+    remaining_acs = payload.get("remaining_acs", [])
+    if isinstance(remaining_acs, list) and remaining_acs:
+        parts.append(f"remaining_acs={', '.join(remaining_acs[:4])}")
+    return " | ".join(parts) if parts else "(handoff exists but is sparse)"
+
+
+# ── Self-Test Harness ──────────────────────────────────────────
+
+def _make_test_args() -> argparse.Namespace:
+    return argparse.Namespace(
+        m="",
+        n=5,
+        tool_repeat_limit=3,
+        max_tool_calls=200,
+        t=30,
+        max_turns=50,
+        handoff_max_bytes=HANDOFF_MAX_BYTES,
+    )
+
+
+def _test_failure_signature_detector_loop() -> None:
+    detector = FailureSignatureDetector(repeat_limit=2)
+    loop, _ = detector.record("Error: database unavailable")
+    assert not loop
+    loop, desc = detector.record("Error: database unavailable")
+    assert loop
+    assert "Repeated failing tool result" in desc
+
+
+def _test_failure_signature_detector_reset() -> None:
+    detector = FailureSignatureDetector(repeat_limit=2)
+    loop, _ = detector.record("Error: timeout")
+    assert not loop
+    loop, _ = detector.record("all good")
+    assert not loop
+    loop, _ = detector.record("Error: timeout")
+    assert not loop
+
+
+def _test_adaptive_tuning_profile_and_flags() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        log_dir = Path(temp_dir)
+        task_hash = "abc123def4567890"
+
+        save_last_success_model(log_dir, "claude-sonnet")
+        for _ in range(2):
+            append_run_history(
+                log_dir,
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "task_hash": task_hash,
+                    "exit_code": 1,
+                    "final_reason": "max_sessions_exhausted",
+                    "stop_reason_counts": {
+                        "loop_detected": 2,
+                        "stall": 1,
+                        "context_limit": 3,
+                    },
+                },
+            )
+
+        args = _make_test_args()
+        apply_adaptive_overrides(
+            args=args,
+            log_dir=log_dir,
+            task_hash=task_hash,
+            cli_args=[],
+            profile="aggressive",
+        )
+        assert args.m == "claude-sonnet"
+        assert args.n > 5
+        assert args.max_tool_calls > 200
+        assert args.max_turns > 50
+
+        args_with_n_flag = _make_test_args()
+        apply_adaptive_overrides(
+            args=args_with_n_flag,
+            log_dir=log_dir,
+            task_hash=task_hash,
+            cli_args=["-n", "9"],
+            profile="aggressive",
+        )
+        assert args_with_n_flag.n == 5
+
+
+def _test_handoff_normalization_enforces_size_and_schema() -> None:
+    huge = "x" * 10_000
+    task = "Implement AC-1 and AC-2 safely."
+    payload = normalize_handoff_payload(
+        {
+            "goal": huge,
+            "success": False,
+            "is_continue": True,
+            "summary": huge,
+            "done": [huge] * 20,
+            "in_flight": huge,
+            "next_step": huge,
+            "discoveries": [huge] * 20,
+            "blockers": [huge] * 20,
+            "artifact_refs": [huge] * 20,
+            "target_ac": "AC-99",
+            "remaining_acs": ["AC-1", "AC-2", "AC-3"],
+        },
+        task=task,
+        session_num=3,
+        ac_ids=["AC-1", "AC-2"],
+        max_bytes=2048,
+    )
+    ok, reason = validate_handoff_payload(payload, max_bytes=2048)
+    assert ok, reason
+    assert len(json.dumps(payload, ensure_ascii=True).encode("utf-8")) <= 2048
+    assert payload["target_ac"] in ("AC-1", "AC-2")
+
+
+def _test_fallback_handoff_from_state() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        state_file = Path(temp_dir) / "_relentless_state.md"
+        handoff_file = Path(temp_dir) / "_relentless_handoff.json"
+        state_file.write_text(
+            "STATUS: IN_PROGRESS\n\n"
+            "## Completed\n"
+            "[STEP] AC-1 implemented\n\n"
+            "## In Progress\n"
+            "Working on AC-2 test stabilization\n\n"
+            "## Discoveries\n"
+            "- AC-2 depends on AC-1 fixtures\n\n"
+            "## Remaining\n"
+            "- AC-2: add retries\n\n"
+            "## Blockers\n"
+            "- waiting for token\n"
+        )
+        payload = fallback_handoff_from_state(
+            task="Build feature with AC-1 and AC-2",
+            state_file=state_file,
+            handoff_file=handoff_file,
+            session_num=2,
+            ac_ids=["AC-1", "AC-2"],
+            max_bytes=HANDOFF_MAX_BYTES,
+            reason="state fallback",
+        )
+        ok, reason = validate_handoff_payload(payload, max_bytes=HANDOFF_MAX_BYTES)
+        assert ok, reason
+        assert payload["next_step"]
+        assert handoff_file.exists()
+
+
+def _test_continuation_prompt_stays_compact() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        state_file = Path(temp_dir) / "_relentless_state.md"
+        handoff_file = Path(temp_dir) / "_relentless_handoff.json"
+        large_blob = "VERY_LARGE_PROGRESS_BLOB_" + ("A" * 6000)
+        state_file.write_text(large_blob)
+        write_handoff_payload(
+            handoff_file,
+            {
+                "goal": "Ship AC-1",
+                "success": False,
+                "is_continue": True,
+                "summary": "Prior session completed setup and tests.",
+                "done": ["AC-1 scaffolded"],
+                "in_flight": "Refining assertion",
+                "next_step": "Finalize AC-1 test pass",
+                "discoveries": ["Need deterministic seed"],
+                "blockers": [],
+                "artifact_refs": ["plugins/relentless/bin/relentless"],
+                "target_ac": "AC-1",
+                "remaining_acs": ["AC-1"],
+            },
+            task="Task with AC-1",
+            session_num=2,
+            ac_ids=["AC-1"],
+            max_bytes=HANDOFF_MAX_BYTES,
+        )
+        prompt = build_prompt(
+            task="Task with AC-1",
+            state_file=state_file,
+            handoff_file=handoff_file,
+            session_num=2,
+            is_continue=True,
+            ac_ids=["AC-1"],
+            max_handoff_bytes=HANDOFF_MAX_BYTES,
+        )
+        assert "VERY_LARGE_PROGRESS_BLOB_" not in prompt
+        assert len(prompt) < 3500
+
+
+def run_self_tests() -> int:
+    tests = [
+        ("failure_signature_detector_loop", _test_failure_signature_detector_loop),
+        ("failure_signature_detector_reset", _test_failure_signature_detector_reset),
+        ("adaptive_tuning_profile_and_flags", _test_adaptive_tuning_profile_and_flags),
+        ("handoff_normalization_enforces_size_and_schema", _test_handoff_normalization_enforces_size_and_schema),
+        ("fallback_handoff_from_state", _test_fallback_handoff_from_state),
+        ("continuation_prompt_stays_compact", _test_continuation_prompt_stays_compact),
+    ]
+
+    failures: list[str] = []
+    print("Running relentless self-tests...")
+    for name, test_fn in tests:
+        try:
+            test_fn()
+            print(f"[PASS] {name}")
+        except Exception as exc:
+            print(f"[FAIL] {name}: {exc}")
+            failures.append(name)
+
+    if failures:
+        print(f"Self-tests failed: {', '.join(failures)}")
+        return 1
+    print("All self-tests passed.")
+    return 0
+
+
+# ── Diagnostic Snapshots ──────────────────────────────────────
+
+def write_diagnostic(
+    reason: str,
+    session_num: int,
+    state_file: Path,
+    log_dir: Path,
+    tracker: StateTracker,
+    audit_trail: list[dict] | None = None,
+    cost_usd: float = 0.0,
+    total_cost_usd: float = 0.0,
+) -> Path:
+    """Preserve full context on failure for human review."""
+    ts = datetime.now().strftime("%H%M%S")
+    path = log_dir / f"diagnostic_s{session_num}_{ts}.json"
+
+    state_content = state_file.read_text() if state_file.exists() else ""
+
+    diag = {
+        "reason": reason,
+        "session": session_num,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "state_hash": tracker.compute_hash(),
+        "state_hash_history": [{"session": s, "hash": h} for s, h in tracker.hashes],
+        "state_content": state_content,
+        "session_cost_usd": cost_usd,
+        "total_cost_usd": total_cost_usd,
+        "audit_trail": (audit_trail or [])[-50:],  # last 50 tool calls
+    }
+
+    path.write_text(json.dumps(diag, indent=2))
+    log.info(f"Diagnostic snapshot written: {path}")
+    return path
+
+
+# ── Escalation Injection ──────────────────────────────────────
+
+def inject_escalation(state_file: Path, reason: str, diag_path: Path):
+    """Prepend ESCALATION to state file so next session / human can see it."""
+    current = state_file.read_text() if state_file.exists() else ""
+    if "ESCALATION" in current:
+        return
+    state_file.write_text(
+        f"ESCALATION: {reason}\n"
+        f"Diagnostic: {diag_path}\n"
+        f"The agent needs human review before continuing.\n\n"
+        f"{current}"
+    )
+
+
+# ── System Prompt ─────────────────────────────────────────────
+
+def build_system_prompt(
+    state_file: Path,
+    handoff_file: Path,
+    escalate_rules: str = "",
+    ac_ids: list[str] | None = None,
+) -> str:
+    ac_list = ac_ids or []
+    ac_hint = ", ".join(ac_list[:8]) if ac_list else ""
+    prompt = f"""You are running inside a relentless auto-continuation loop. Your session has a
+CONTEXT BUDGET. When it's exhausted you will be CUT OFF and a fresh session will continue
+from a compact handoff. The task/PRD is re-sent to every session, so you always have the plan.
+DO NOT rely on long in-memory context across sessions.
+
+State file: {state_file}
+Handoff file: {handoff_file}
+
+## STATE FILE FORMAT
+
+```markdown
+STATUS: IN_PROGRESS | COMPLETE | ESCALATION
+
+## Completed
+[STEP] <action> — <result> (file paths, specifics)
+[STEP] <action> — <result>
+
+## In Progress
+Working on: <current step from the plan/PRD>
+
+## Discoveries
+<!-- Implementation decisions NOT in the PRD — approach changes, gotchas, constraints
+     found during work. These are expensive to re-derive. -->
+- Tried X, failed because Y — switched to Z
+- Found that A requires B (not documented in PRD)
+
+## Remaining
+<!-- Which acceptance criteria / plan steps are not yet started -->
+- AC-3: ...
+- AC-4: ...
+
+## Blockers
+<!-- Anything needing human input or a different approach -->
+```
+
+## HANDOFF JSON CONTRACT (STRICT)
+
+Write/update `{handoff_file}` at least every ~5 tool calls and before ending a session.
+Keep it concise (bounded memory). Use this exact schema:
+
+```json
+{{
+  "schema_version": "{HANDOFF_SCHEMA_VERSION}",
+  "session": <int>,
+  "goal": "<one-line goal>",
+  "success": <bool>,
+  "is_continue": <bool>,
+  "summary": "<first-person chronological summary>",
+  "done": ["<completed items>"],
+  "in_flight": "<current item>",
+  "next_step": "<next concrete action>",
+  "discoveries": ["<non-obvious findings>"],
+  "blockers": ["<human decisions needed>"],
+  "artifact_refs": ["<paths touched>"],
+  "target_ac": "<AC-id or empty>",
+  "remaining_acs": ["<AC ids still open>"],
+  "updated_at": "<ISO8601>"
+}}
+```
+
+## RULES
+
+1. WRITE BOTH FILES WITHIN YOUR FIRST 3 TOOL CALLS.
+   - Session 1: initialize state and handoff.
+   - Continuation: read handoff first, then state file.
+   - If you haven't updated handoff in the last 5 tool calls, update it NOW.
+
+2. DO NOT DUPLICATE THE PLAN. The task/PRD is passed to every session. The state file
+   and handoff track progress against it — not a copy of it.
+
+3. DISCOVERIES ARE CRITICAL. If you learn something during implementation that isn't
+   in the PRD (approach changes, unexpected constraints, what worked/didn't), write it
+   to state + handoff Discoveries. The next session needs these to avoid re-learning them.
+
+4. UPDATE "In Progress" BEFORE starting each step — if you get cut off mid-step,
+   the next session knows exactly where you were and can verify it completed.
+
+5. STEP LOGGING: After each significant action, append to Completed:
+   `[STEP] <action> — <result>`
+   Include file paths and specifics. This is the audit trail.
+
+6. SELF-LOOP DETECTION — Before each action, check Completed:
+   - Same step failed 2+ times with same error → do NOT retry.
+   - Try a DIFFERENT approach OR set STATUS: ESCALATION.
+
+7. FINISH PROTOCOL:
+   - On completion: set `success=true`, `is_continue=false`, and summarize what passed.
+   - On continuation: set `success=false`, `is_continue=true`, with explicit `next_step`.
+   - Never leave these ambiguous.
+
+8. NEVER redo work listed in Completed.
+
+9. CONTEXT AWARENESS:
+   - After EVERY file edit or test run, update state + handoff immediately.
+   - Keep handoff compact and bounded. Do not paste large logs or file dumps.
+
+10. TOOL TIMEOUTS: Use focused tests with timeouts (pytest --timeout=10 -x,
+    jest --bail --testTimeout=10000). Never run full suites.
+
+11. HEARTBEAT: Update handoff every ~10 tool calls during long operations.
+
+12. SESSION FOCUS: Do one micro-objective per session. Prefer single-AC progress."""
+
+    if escalate_rules:
+        prompt += f"""
+
+13. PRD MODE: This task comes from a Product Requirements Document.
+   - Use Acceptance Criteria as your completion checklist. Each AC must pass.
+   - Pick ONE `target_ac` per session and focus progress there before switching.
+   - Keep `remaining_acs` accurate in handoff after each test/edit cycle.
+   - Respect Non-Goals / out_of_scope — do NOT build anything excluded.
+   - Follow constraints.key_files and constraints.patterns.
+   - STOP and write ESCALATION for:
+{escalate_rules}
+   - Mark "STATUS: COMPLETE" only when ALL acceptance criteria are satisfied."""
+    elif ac_hint:
+        prompt += f"""
+
+13. ACCEPTANCE CRITERIA DISCIPLINE:
+   - Known AC IDs: {ac_hint}
+   - Keep `target_ac` and `remaining_acs` in sync with your progress."""
+
+    return prompt
+
+
+# ── PRD Detection ─────────────────────────────────────────────
+
+def detect_prd_mode(task: str) -> tuple[bool, str]:
+    markers = ['"agent_mode"', '"escalate_on"', "Agent Handoff"]
+    if not any(m in task for m in markers):
+        return False, ""
+
+    rules = []
+    in_escalate = False
+    for line in task.splitlines():
+        if '"escalate_on"' in line:
+            in_escalate = True
+            continue
+        if in_escalate:
+            if "]" in line:
+                in_escalate = False
+                continue
+            stripped = line.strip().strip('",')
+            if stripped:
+                rules.append(f"     - {stripped}")
+    return True, "\n".join(rules)
+
+
+# ── Session Prompt Builder ────────────────────────────────────
+
+def build_prompt(
+    task: str,
+    state_file: Path,
+    handoff_file: Path,
+    session_num: int,
+    is_continue: bool,
+    ac_ids: list[str],
+    max_handoff_bytes: int,
+) -> str:
+    handoff_payload, _ = read_handoff_payload(handoff_file, max_handoff_bytes)
+    handoff_brief = summarize_handoff_for_prompt(handoff_payload)
+    target_ac = ""
+    if handoff_payload and isinstance(handoff_payload.get("target_ac"), str):
+        target_ac = handoff_payload.get("target_ac", "")
+    if not target_ac and ac_ids:
+        target_ac = ac_ids[0]
+
+    if session_num == 1 and not is_continue:
+        ac_hint = f"Start with target AC `{target_ac}`." if target_ac else ""
+        return (
+            f"# Task\n\n{task}\n\n"
+            f"# Working directory: {os.getcwd()}\n\n"
+            f"Within your first 3 tool calls, initialize BOTH:\n"
+            f"- State markdown at `{state_file}`\n"
+            f"- Handoff JSON at `{handoff_file}`\n\n"
+            f"List acceptance criteria / steps as Remaining items and begin with one "
+            f"micro-objective. {ac_hint}\n"
+            f"When done, set state `STATUS: COMPLETE` and handoff `success=true, is_continue=false`."
+        )
+
+    return (
+        f"# Continue Task (Session {session_num})\n\n"
+        f"## Task / PRD:\n{task}\n\n"
+        f"## Prior handoff (compact):\n{handoff_brief}\n\n"
+        f"## Instructions:\n"
+        f"1. Read handoff JSON at `{handoff_file}` FIRST, then state file at `{state_file}`.\n"
+        f"2. Verify `in_flight` completion before starting new work.\n"
+        f"3. Continue from `next_step` and keep focus to one AC at a time.\n"
+        f"4. Keep handoff concise (summary + next_step + target_ac + remaining_acs).\n"
+        f"5. If a step failed 2+ times, change approach or escalate.\n"
+        f"6. On stop, always write finish protocol in handoff:\n"
+        f"   - success=true,is_continue=false when done\n"
+        f"   - success=false,is_continue=true otherwise"
+    )
+
+
+# ── SDK Session Runner ────────────────────────────────────────
+
+async def run_session(
+    prompt: str,
+    system_prompt: str,
+    session_num: int,
+    args: argparse.Namespace,
+    state_file: Path,
+    tracker: StateTracker,
+    log_dir: Path,
+    total_cost: float,
+) -> tuple[str, float, list[dict]]:
+    """Run a single SDK session. Returns (stop_reason, session_cost, audit_trail).
+
+    stop_reason: "complete" | "incomplete" | "loop_detected" | "stall" |
+                 "context_limit" | "error"
+    """
+    loop_detector = ToolLoopDetector(repeat_limit=args.tool_repeat_limit)
+    failure_detector = FailureSignatureDetector(repeat_limit=args.failure_repeat_limit)
+    context_budget = ContextBudget(
+        max_turns=args.max_turns,
+        max_chars=args.context_chars,
+        soft_pct=args.context_soft_pct,
+        hard_pct=args.context_hard_pct,
+    )
+    session_cost = 0.0
+
+    stderr_lines: list[str] = []
+
+    def capture_stderr(line: str) -> None:
+        stderr_lines.append(line)
+        log.debug(f"[session {session_num}] stderr: {line.rstrip()}")
+
+    # Build SDK options — prefer system isaac CLI over bundled (may be outdated)
+    system_cli = shutil.which("isaac")
+    opts_kwargs: dict = {
+        "permission_mode": args.p,
+        "system_prompt": {
+            "type": "preset",
+            "preset": "claude_code",
+            "append": system_prompt,
+        },
+        "cwd": os.getcwd(),
+        "stderr": capture_stderr,
+    }
+    if system_cli:
+        opts_kwargs["cli_path"] = system_cli
+
+    if args.m:
+        opts_kwargs["model"] = args.m
+    if args.b:
+        opts_kwargs["max_budget_usd"] = float(args.b)
+
+    options = ClaudeAgentOptions(**opts_kwargs)
+
+    log.info(f"[session {session_num}] Starting SDK session")
+
+    timeout_secs = args.t * 60
+    session_start = time.time()
+    timed_out = False
+
+    try:
+        async for message in _stream_with_detection(
+            prompt=prompt,
+            options=options,
+            session_num=session_num,
+            loop_detector=loop_detector,
+            context_budget=context_budget,
+            state_file=state_file,
+            tracker=tracker,
+            log_dir=log_dir,
+            verbose=args.v,
+            total_cost=total_cost,
+            max_tool_calls=args.max_tool_calls,
+            failure_detector=failure_detector,
+        ):
+            # Check timeout between messages (avoids asyncio.timeout/anyio conflict)
+            if time.time() - session_start > timeout_secs:
+                timed_out = True
+                break
+
+            # _stream_with_detection yields ResultMessage or loop signal
+            if isinstance(message, ResultMessage):
+                session_cost = message.total_cost_usd or 0.0
+                is_error = message.is_error
+                turns = message.num_turns
+                log.info(
+                    f"[session {session_num}] Finished: turns={turns} "
+                    f"cost=${session_cost:.4f} error={is_error}"
+                )
+                if is_error:
+                    return "error", session_cost, loop_detector.audit_trail
+                return "complete", session_cost, loop_detector.audit_trail
+
+            elif isinstance(message, str) and message.startswith("CONTEXT_LIMIT:"):
+                status = message[14:]
+                log.info(f"[session {session_num}] Context limit reached: {status}")
+                return "context_limit", session_cost, loop_detector.audit_trail
+
+            elif isinstance(message, str) and message.startswith("LOOP:"):
+                reason = message[5:]
+                log.error(f"[session {session_num}] Loop detected: {reason}")
+                return "loop_detected", session_cost, loop_detector.audit_trail
+
+    except Exception as exc:
+        # Suppress anyio cancel-scope cleanup errors from SDK internals
+        if "cancel scope" in str(exc):
+            log.debug(f"[session {session_num}] Suppressed SDK cleanup error: {exc}")
+        else:
+            log.error(f"[session {session_num}] Error: {exc}")
+            return "error", session_cost, loop_detector.audit_trail
+
+    if timed_out:
+        log.error(f"[session {session_num}] Timeout after {args.t}m")
+        diag = write_diagnostic(
+            reason=f"Session timeout ({args.t}m)",
+            session_num=session_num,
+            state_file=state_file,
+            log_dir=log_dir,
+            tracker=tracker,
+            audit_trail=loop_detector.audit_trail,
+            cost_usd=session_cost,
+            total_cost_usd=total_cost + session_cost,
+        )
+        inject_escalation(state_file, f"Session {session_num} timed out after {args.t}m", diag)
+        return "stall", session_cost, loop_detector.audit_trail
+
+    return "incomplete", session_cost, loop_detector.audit_trail
+
+
+async def _stream_with_detection(
+    prompt: str,
+    options: ClaudeAgentOptions,
+    session_num: int,
+    loop_detector: ToolLoopDetector,
+    context_budget: ContextBudget,
+    state_file: Path,
+    tracker: StateTracker,
+    log_dir: Path,
+    verbose: bool,
+    total_cost: float,
+    max_tool_calls: int,
+    failure_detector: FailureSignatureDetector,
+):
+    """Async generator that wraps query() with per-message loop detection.
+
+    Yields ResultMessage on normal completion, "LOOP:<reason>" on loop,
+    or "CONTEXT_LIMIT:<status>" when context budget is exhausted.
+    """
+    last_message_time = time.time()
+
+    async for message in query(prompt=prompt, options=options):
+        last_message_time = time.time()
+
+        # ── Track context budget on every message ──
+        context_budget.record_message(message)
+
+        if context_budget.should_warn():
+            log.warning(
+                f"[session {session_num}] Context budget at {context_budget.utilization:.0%} — "
+                f"{context_budget.status()}"
+            )
+
+        if isinstance(message, AssistantMessage):
+            # ── Check hard context limit BETWEEN turns (not mid-tool-call) ──
+            if context_budget.should_stop():
+                log.warning(
+                    f"[session {session_num}] Context budget exceeded — "
+                    f"graceful handoff: {context_budget.status()}"
+                )
+                yield f"CONTEXT_LIMIT:{context_budget.status()}"
+                return
+
+            for block in message.content:
+                if isinstance(block, ToolUseBlock):
+                    tool_name = block.name
+                    tool_input = block.input
+
+                    if verbose:
+                        input_preview = json.dumps(tool_input, default=str)[:120]
+                        log.info(f"  [{loop_detector.total_calls + 1}] {tool_name}: {input_preview}")
+
+                    # ── Intra-session loop detection ──
+                    is_loop, loop_desc = loop_detector.record(tool_name, tool_input)
+                    if is_loop:
+                        log.error(f"[session {session_num}] Tool loop: {loop_desc}")
+                        diag = write_diagnostic(
+                            reason=f"Intra-session tool loop: {loop_desc}",
+                            session_num=session_num,
+                            state_file=state_file,
+                            log_dir=log_dir,
+                            tracker=tracker,
+                            audit_trail=loop_detector.audit_trail,
+                            total_cost_usd=total_cost,
+                        )
+                        inject_escalation(state_file, f"Tool loop in session {session_num}: {loop_desc}", diag)
+                        yield f"LOOP:{loop_desc}"
+                        return
+
+                    # ── Safety cap ──
+                    if loop_detector.total_calls >= max_tool_calls:
+                        log.warning(f"[session {session_num}] Hit {max_tool_calls} tool call cap")
+                        yield f"LOOP:Safety cap — {max_tool_calls} tool calls in one session"
+                        return
+
+                elif isinstance(block, TextBlock) and verbose:
+                    text_preview = block.text[:200].replace("\n", " ")
+                    if text_preview.strip():
+                        log.info(f"  [text] {text_preview}")
+
+        elif isinstance(message, ResultMessage):
+            yield message
+            return
+
+        elif isinstance(message, UserMessage):
+            # Tool results can blow up the context — check budget after recording
+            if context_budget.should_stop():
+                log.warning(
+                    f"[session {session_num}] Context budget exceeded after tool result — "
+                    f"graceful handoff: {context_budget.status()}"
+                )
+                yield f"CONTEXT_LIMIT:{context_budget.status()}"
+                return
+            tool_result_text = str(message.content)
+            repeated_failure, failure_desc = failure_detector.record(tool_result_text)
+            if repeated_failure:
+                log.error(f"[session {session_num}] Repeated failure signature: {failure_desc}")
+                diag = write_diagnostic(
+                    reason=f"Repeated failure signature: {failure_desc}",
+                    session_num=session_num,
+                    state_file=state_file,
+                    log_dir=log_dir,
+                    tracker=tracker,
+                    audit_trail=loop_detector.audit_trail,
+                    total_cost_usd=total_cost,
+                )
+                inject_escalation(
+                    state_file,
+                    f"Repeated failure loop in session {session_num}: {failure_desc}",
+                    diag,
+                )
+                yield f"LOOP:{failure_desc}"
+                return
+            if verbose:
+                log.debug(f"  [user msg] (tool result or system)")
+
+
+# ── Checkpoint Micro-Session ─────────────────────────────────
+
+async def run_checkpoint_session(
+    state_file: Path,
+    handoff_file: Path,
+    task: str,
+    audit_trail: list[dict],
+    args: argparse.Namespace,
+    session_num: int,
+    reason: str,
+    ac_ids: list[str],
+) -> float:
+    """Spawn a brief session to finalize state + handoff after interruption.
+
+    This micro-session gets a fresh context with enough info to update BOTH files:
+    - The original task (so it knows the goal)
+    - The last N tool calls from the audit trail (so it knows recent progress)
+    - Instruction to read state + handoff, update finish protocol, and stop
+    """
+    # Summarize recent tool calls for the checkpoint agent
+    recent = audit_trail[-10:] if audit_trail else []
+    recent_summary = "\n".join(
+        f"  {i+1}. {entry['tool']}" for i, entry in enumerate(recent)
+    )
+
+    checkpoint_prompt = (
+        f"CHECKPOINT MICRO-SESSION ({reason}).\n\n"
+        f"Session #{session_num} interrupted. Last tool calls before interruption:\n"
+        f"{recent_summary or '  (no tool calls recorded)'}\n\n"
+        f"Read state file `{state_file}` and handoff file `{handoff_file}` and update BOTH:\n"
+        f"- If 'In Progress' step looks complete based on the tool calls above, move it "
+        f"to Completed.\n"
+        f"- Add: '[HANDOFF] Session {session_num} ended — {reason}'\n"
+        f"- Preserve Discoveries section — the next session needs those.\n"
+        f"- Write compact JSON handoff with schema_version='{HANDOFF_SCHEMA_VERSION}', "
+        f"success/is_continue/summary/next_step/target_ac/remaining_acs.\n"
+        f"- Do NOT continue implementing. Only checkpoint and stop.\n"
+    )
+
+    system_cli = shutil.which("isaac")
+    opts_kwargs: dict = {
+        "permission_mode": args.p,
+        "cwd": os.getcwd(),
+        "max_budget_usd": 0.50,  # cap checkpoint cost
+    }
+    if system_cli:
+        opts_kwargs["cli_path"] = system_cli
+    if args.m:
+        opts_kwargs["model"] = args.m
+    options = ClaudeAgentOptions(**opts_kwargs)
+
+    log.info(f"[checkpoint] Spawning micro-session to finalize state file")
+    cost = 0.0
+
+    async def _run():
+        nonlocal cost
+        async for msg in query(prompt=checkpoint_prompt, options=options):
+            if isinstance(msg, ResultMessage):
+                cost = msg.total_cost_usd or 0.0
+
+    try:
+        await asyncio.wait_for(_run(), timeout=120)
+        log.info(f"[checkpoint] Done (${cost:.4f})")
+    except asyncio.TimeoutError:
+        log.warning("[checkpoint] Timed out after 120s")
+    except Exception as e:
+        log.warning(f"[checkpoint] Failed: {e}")
+
+    # If the checkpoint did not leave a valid handoff, generate deterministic fallback
+    payload, _ = read_handoff_payload(handoff_file, args.handoff_max_bytes)
+    if payload is None:
+        fallback_handoff_from_state(
+            task=task,
+            state_file=state_file,
+            handoff_file=handoff_file,
+            session_num=session_num,
+            ac_ids=ac_ids,
+            max_bytes=args.handoff_max_bytes,
+            reason=f"checkpoint fallback ({reason})",
+        )
+    return cost
+
+
+async def ensure_handoff_after_session(
+    *,
+    state_file: Path,
+    handoff_file: Path,
+    task: str,
+    audit_trail: list[dict],
+    args: argparse.Namespace,
+    session_num: int,
+    stop_reason: str,
+    ac_ids: list[str],
+) -> tuple[dict, float]:
+    payload, reason = read_handoff_payload(handoff_file, args.handoff_max_bytes)
+    if payload is not None:
+        normalized = write_handoff_payload(
+            handoff_file,
+            payload,
+            task=task,
+            session_num=session_num,
+            ac_ids=ac_ids,
+            max_bytes=args.handoff_max_bytes,
+        )
+        return normalized, 0.0
+
+    log.warning(f"[session {session_num}] Invalid/missing handoff: {reason}")
+    cp_cost = 0.0
+    if not args.no_checkpoint:
+        cp_cost = await run_checkpoint_session(
+            state_file=state_file,
+            handoff_file=handoff_file,
+            task=task,
+            audit_trail=audit_trail,
+            args=args,
+            session_num=session_num,
+            reason=f"handoff-repair:{stop_reason}",
+            ac_ids=ac_ids,
+        )
+        payload, reason = read_handoff_payload(handoff_file, args.handoff_max_bytes)
+        if payload is not None:
+            normalized = write_handoff_payload(
+                handoff_file,
+                payload,
+                task=task,
+                session_num=session_num,
+                ac_ids=ac_ids,
+                max_bytes=args.handoff_max_bytes,
+            )
+            return normalized, cp_cost
+
+    fallback = fallback_handoff_from_state(
+        task=task,
+        state_file=state_file,
+        handoff_file=handoff_file,
+        session_num=session_num,
+        ac_ids=ac_ids,
+        max_bytes=args.handoff_max_bytes,
+        reason=f"fallback:{stop_reason}:{reason}",
+    )
+    return fallback, cp_cost
+
+
+# ── Main ──────────────────────────────────────────────────────
+
+def _suppress_anyio_cleanup(loop, context):
+    """Suppress known anyio cancel-scope cleanup errors from Claude Agent SDK."""
+    exc = context.get("exception")
+    if exc and "cancel scope" in str(exc):
+        return  # Swallow — this is a known SDK cleanup race condition
+    loop.default_exception_handler(context)
+
+
+async def async_main():
+    # Suppress noisy anyio cancel-scope errors from SDK generator cleanup
+    asyncio.get_event_loop().set_exception_handler(_suppress_anyio_cleanup)
+
+    parser = argparse.ArgumentParser(
+        description="relentless — auto-continuing Claude Code agent (SDK)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("task", nargs="*", help="Task description")
+    parser.add_argument("-n", type=int, default=5, metavar="NUM", help="Max sessions (default: 5)")
+    parser.add_argument("-b", type=str, default="", metavar="USD", help="Max budget per session in USD")
+    parser.add_argument("-m", type=str, default="", metavar="MODEL", help="Model to use")
+    parser.add_argument("-d", type=str, default=".", metavar="DIR", help="Working directory")
+    parser.add_argument("-f", type=str, default="", metavar="FILE", help="Read task from file")
+    parser.add_argument("-p", type=str, default="auto", metavar="MODE", help="Permission mode (default: auto)")
+    parser.add_argument("-s", type=str, default="./_relentless_state.md", metavar="FILE", help="State file path")
+    parser.add_argument(
+        "--handoff-file",
+        type=str,
+        default="",
+        metavar="FILE",
+        help="Handoff JSON path (default: alongside state file)",
+    )
+    parser.add_argument("-t", type=int, default=30, metavar="MINS", help="Session timeout in minutes (default: 30)")
+    parser.add_argument("-v", action="store_true", help="Verbose output")
+    parser.add_argument("-c", action="store_true", help="Continue from existing state file")
+    parser.add_argument("--dry-run", action="store_true", help="Print prompt without running")
+    parser.add_argument(
+        "--max-turns", type=int, default=DEFAULT_MAX_TURNS, metavar="N",
+        help=f"Max assistant turns per session before handoff (default: {DEFAULT_MAX_TURNS})",
+    )
+    parser.add_argument(
+        "--context-chars", type=int, default=DEFAULT_CONTEXT_CHARS, metavar="N",
+        help=f"Estimated char budget per session (default: {DEFAULT_CONTEXT_CHARS:,})",
+    )
+    parser.add_argument(
+        "--no-checkpoint", action="store_true",
+        help="Skip checkpoint micro-session on context handoff",
+    )
+    parser.add_argument(
+        "--stuck-threshold", type=int, default=STUCK_THRESHOLD, metavar="N",
+        help=f"Escalate after N sessions with identical state hash (default: {STUCK_THRESHOLD})",
+    )
+    parser.add_argument(
+        "--tool-repeat-limit", type=int, default=TOOL_REPEAT_LIMIT, metavar="N",
+        help=f"Same tool+input N times in one session → loop (default: {TOOL_REPEAT_LIMIT})",
+    )
+    parser.add_argument(
+        "--max-tool-calls", type=int, default=MAX_TOOL_CALLS_PER_SESSION, metavar="N",
+        help=f"Safety cap on tool calls per session (default: {MAX_TOOL_CALLS_PER_SESSION})",
+    )
+    parser.add_argument(
+        "--failure-repeat-limit", type=int, default=FAILURE_REPEAT_LIMIT, metavar="N",
+        help=f"Same failing tool-result signature N times in one session → loop (default: {FAILURE_REPEAT_LIMIT})",
+    )
+    parser.add_argument(
+        "--context-soft-pct", type=float, default=CONTEXT_SOFT_PCT, metavar="F",
+        help=f"Context utilization fraction to warn (default: {CONTEXT_SOFT_PCT})",
+    )
+    parser.add_argument(
+        "--context-hard-pct", type=float, default=CONTEXT_HARD_PCT, metavar="F",
+        help=f"Context utilization fraction to force handoff (default: {CONTEXT_HARD_PCT})",
+    )
+    parser.add_argument(
+        "--handoff-max-bytes",
+        type=int,
+        default=HANDOFF_MAX_BYTES,
+        metavar="N",
+        help=f"Max serialized handoff JSON bytes (default: {HANDOFF_MAX_BYTES})",
+    )
+    parser.add_argument(
+        "--adaptive",
+        dest="adaptive",
+        action="store_true",
+        default=True,
+        help="Enable adaptive tuning from prior relentless runs (default: on)",
+    )
+    parser.add_argument(
+        "--no-adaptive",
+        dest="adaptive",
+        action="store_false",
+        help="Disable adaptive tuning from prior relentless runs",
+    )
+    parser.add_argument(
+        "--adaptive-profile",
+        choices=("conservative", "balanced", "aggressive"),
+        default=ADAPTIVE_PROFILE_DEFAULT,
+        help="Adaptive tuning profile (default: balanced)",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run internal detectors/tuning self-tests and exit",
+    )
+    args = parser.parse_args()
+    cli_args = sys.argv[1:]
+
+    if args.self_test:
+        sys.exit(run_self_tests())
+
+    # ── Resolve task ──
+    if args.f:
+        task = Path(args.f).read_text()
+    elif args.task:
+        task = " ".join(args.task)
+    elif not sys.stdin.isatty():
+        task = sys.stdin.read()
+    else:
+        print("Error: No task provided. Pass as argument, -f file, or pipe via stdin.", file=sys.stderr)
+        sys.exit(1)
+
+    # ── Setup ──
+    os.chdir(args.d)
+    state_file = Path(os.path.abspath(args.s))
+    handoff_file = (
+        Path(os.path.abspath(args.handoff_file))
+        if args.handoff_file
+        else default_handoff_file_for_state(state_file)
+    )
+    log_dir = Path(os.getcwd()) / ".relentless_logs"
+
+    master_log = setup_logging(log_dir, args.v)
+    tracker = StateTracker(state_file, stuck_threshold=args.stuck_threshold)
+    task_hash = compute_task_hash(task)
+    adaptive_notes: list[str] = []
+    if args.adaptive:
+        adaptive_notes = apply_adaptive_overrides(
+            args=args,
+            log_dir=log_dir,
+            task_hash=task_hash,
+            cli_args=cli_args,
+            profile=args.adaptive_profile,
+        )
+
+    # PRD detection
+    is_prd, escalate_rules = detect_prd_mode(task)
+    ac_ids = extract_acceptance_criteria(task) if is_prd else []
+    system_prompt = build_system_prompt(
+        state_file=state_file,
+        handoff_file=handoff_file,
+        escalate_rules=escalate_rules,
+        ac_ids=ac_ids,
+    )
+
+    # Bootstrap handoff if possible so continuation starts from a compact protocol object
+    existing_handoff, _ = read_handoff_payload(handoff_file, args.handoff_max_bytes)
+    if existing_handoff is None and state_file.exists():
+        fallback_handoff_from_state(
+            task=task,
+            state_file=state_file,
+            handoff_file=handoff_file,
+            session_num=0,
+            ac_ids=ac_ids,
+            max_bytes=args.handoff_max_bytes,
+            reason="startup bootstrap",
+        )
+
+    # Strip Claude env vars so nested SDK sessions work
+    os.environ.pop("CLAUDECODE", None)
+    os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+
+    # ── Banner ──
+    print("╔══════════════════════════════════════════════╗")
+    print("║  relentless — Claude Agent SDK engine         ║")
+    print("╠══════════════════════════════════════════════╣")
+    print(f"║  Sessions:      max {args.n}")
+    print(f"║  Model:         {args.m or 'default'}")
+    print(f"║  Budget:        {args.b or 'unlimited'}/session")
+    print(f"║  Perms:         {args.p}")
+    print(f"║  State:         {state_file}")
+    print(f"║  Handoff:       {handoff_file} ({args.handoff_max_bytes} bytes cap)")
+    print(f"║  Timeout:       {args.t}m/session")
+    print(f"║  Loop guard:    tool repeat ≥{args.tool_repeat_limit}x → escalate")
+    print(f"║  Fail signature:{args.failure_repeat_limit} repeated failures → escalate")
+    print(f"║  Cross-session: {args.stuck_threshold} identical states → escalate")
+    print(f"║  Context:       {args.max_turns} turns / {args.context_chars:,} chars → handoff")
+    print(
+        f"║  Adaptive:      {'on' if args.adaptive else 'off'} "
+        f"({args.adaptive_profile})"
+    )
+    if args.adaptive and adaptive_notes:
+        print("║  Adaptive notes:")
+        for note in adaptive_notes[:3]:
+            print(f"║    - {note}")
+    print(f"║  Checkpoint:    {'off' if args.no_checkpoint else 'on (micro-session)'}")
+    print(f"║  Logs:          {log_dir}/")
+    if is_prd:
+        print("║  Mode:          PRD (acceptance criteria enforced)")
+    print("╚══════════════════════════════════════════════╝")
+    print()
+
+    total_start = time.time()
+    total_cost = 0.0
+    stop_reason_counts: dict[str, int] = {}
+
+    def finalize_run(exit_code: int, final_reason: str, sessions_used: int) -> None:
+        elapsed_now = int(time.time() - total_start)
+        if not args.dry_run:
+            append_run_history(
+                log_dir,
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "task_hash": task_hash,
+                    "exit_code": exit_code,
+                    "final_reason": final_reason,
+                    "sessions_used": sessions_used,
+                    "elapsed_seconds": elapsed_now,
+                    "total_cost_usd": round(total_cost, 6),
+                    "model": args.m or "default",
+                    "stop_reason_counts": stop_reason_counts,
+                    "adaptive_enabled": args.adaptive,
+                    "adaptive_profile": args.adaptive_profile,
+                    "adaptive_notes": adaptive_notes,
+                    "state_file": str(state_file),
+                    "handoff_file": str(handoff_file),
+                },
+            )
+            if exit_code == 0 and args.m:
+                save_last_success_model(log_dir, args.m)
+        sys.exit(exit_code)
+
+    for session_num in range(1, args.n + 1):
+        print(f"━━━ Session {session_num}/{args.n} ━━━")
+
+        prompt = build_prompt(
+            task=task,
+            state_file=state_file,
+            handoff_file=handoff_file,
+            session_num=session_num,
+            is_continue=args.c,
+            ac_ids=ac_ids,
+            max_handoff_bytes=args.handoff_max_bytes,
+        )
+
+        if args.dry_run:
+            print("[DRY RUN] Would send prompt:")
+            print("---")
+            print(prompt)
+            print("---")
+            print(f"\n[DRY RUN] System prompt ({len(system_prompt)} chars):")
+            print(system_prompt[:500] + "..." if len(system_prompt) > 500 else system_prompt)
+            finalize_run(0, "dry_run", 0)
+
+        # ── Run session via SDK ──
+        stop_reason, session_cost, audit_trail = await run_session(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            session_num=session_num,
+            args=args,
+            state_file=state_file,
+            tracker=tracker,
+            log_dir=log_dir,
+            total_cost=total_cost,
+        )
+        stop_reason_counts[stop_reason] = stop_reason_counts.get(stop_reason, 0) + 1
+
+        total_cost += session_cost
+        elapsed = int(time.time() - total_start)
+        print(f"  Session cost: ${session_cost:.4f} | Total: ${total_cost:.4f} | Elapsed: {elapsed}s")
+
+        checkpoint_cost = 0.0
+
+        # ── Handle context budget handoff ──
+        if stop_reason == "context_limit":
+            print("  ⚡ Context budget reached — graceful handoff")
+            if not args.no_checkpoint:
+                print("  ↳ Running checkpoint micro-session...")
+                checkpoint_cost = await run_checkpoint_session(
+                    state_file=state_file,
+                    handoff_file=handoff_file,
+                    task=task,
+                    audit_trail=audit_trail,
+                    args=args,
+                    session_num=session_num,
+                    reason="context_limit",
+                    ac_ids=ac_ids,
+                )
+                total_cost += checkpoint_cost
+                if checkpoint_cost > 0:
+                    print(f"    Checkpoint cost: ${checkpoint_cost:.4f}")
+
+        # Validate/repair handoff after every session (unified recovery path)
+        session_handoff, repair_cost = await ensure_handoff_after_session(
+            state_file=state_file,
+            handoff_file=handoff_file,
+            task=task,
+            audit_trail=audit_trail,
+            args=args,
+            session_num=session_num,
+            stop_reason=stop_reason,
+            ac_ids=ac_ids,
+        )
+        if repair_cost > 0:
+            total_cost += repair_cost
+            print(f"  Handoff repair checkpoint cost: ${repair_cost:.4f}")
+
+        append_run_journal(
+            log_dir,
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "task_hash": task_hash,
+                "session": session_num,
+                "stop_reason": stop_reason,
+                "session_cost_usd": round(session_cost, 6),
+                "checkpoint_cost_usd": round(checkpoint_cost + repair_cost, 6),
+                "total_cost_usd": round(total_cost, 6),
+                "audit_tool_calls": len(audit_trail),
+                "handoff": {
+                    "success": bool(session_handoff.get("success")),
+                    "is_continue": bool(session_handoff.get("is_continue")),
+                    "target_ac": session_handoff.get("target_ac", ""),
+                    "next_step": session_handoff.get("next_step", ""),
+                    "summary": session_handoff.get("summary", ""),
+                    "remaining_acs": session_handoff.get("remaining_acs", []),
+                },
+            },
+        )
+
+        if stop_reason == "context_limit":
+
+            tracker.record(session_num)
+            if session_num < args.n:
+                print(f"  Continuing to session {session_num + 1} with fresh context...\n")
+            continue
+
+        # ── Handle loop detection (intra-session) ──
+        if stop_reason == "loop_detected":
+            diag = write_diagnostic(
+                reason=f"Intra-session loop in session {session_num}",
+                session_num=session_num,
+                state_file=state_file,
+                log_dir=log_dir,
+                tracker=tracker,
+                audit_trail=audit_trail,
+                cost_usd=session_cost,
+                total_cost_usd=total_cost,
+            )
+            print(f"\n⚠ Tool loop detected in session {session_num}")
+            print(f"  Diagnostic: {diag}")
+            # Don't exit — continue to next session which may take a different approach
+            tracker.record(session_num)
+
+            stuck, stuck_msg = tracker.is_stuck()
+            if stuck:
+                inject_escalation(state_file, f"Agent stuck — {stuck_msg}", diag)
+                print(f"  Cross-session loop also detected: {stuck_msg}")
+                print(f"\n━━━ State at pause ━━━")
+                if state_file.exists():
+                    print(state_file.read_text())
+                finalize_run(2, "cross_session_loop_after_tool_loop", session_num)
+
+            if session_num < args.n:
+                print(f"  Continuing to session {session_num + 1} (will try different approach)...\n")
+            continue
+
+        # ── Record state hash (cross-session loop guard) ──
+        tracker.record(session_num)
+
+        # ── Check completion ──
+        handoff_success = bool(session_handoff.get("success"))
+        handoff_summary = str(session_handoff.get("summary", "")).strip()
+        state_complete = False
+        if state_file.exists():
+            content = state_file.read_text()
+            first_line = content.splitlines()[0] if content.strip() else ""
+            state_complete = "STATUS: COMPLETE" in first_line.upper()
+
+            if handoff_success or state_complete:
+                print(f"\n✓ Task completed in session {session_num} ({elapsed}s, ${total_cost:.4f})\n")
+                if handoff_summary:
+                    print(f"Finish summary: {handoff_summary}")
+                print("━━━ Final state ━━━")
+                print(content)
+                finalize_run(0, "success", session_num)
+        elif handoff_success:
+            print(f"\n✓ Task completed in session {session_num} ({elapsed}s, ${total_cost:.4f})\n")
+            if handoff_summary:
+                print(f"Finish summary: {handoff_summary}")
+            finalize_run(0, "success_via_handoff", session_num)
+
+        # ── Check escalation ──
+        if state_file.exists() and "ESCALATION" in state_file.read_text().upper():
+            print(f"\n⚠ Escalation detected in session {session_num} ({elapsed}s, ${total_cost:.4f})\n")
+            print("━━━ State with escalation ━━━")
+            print(state_file.read_text())
+            print("\nReview the escalation above and decide how to proceed.")
+            finalize_run(2, "escalation_state", session_num)
+
+        # ── Check cross-session state hash loop ──
+        stuck, stuck_msg = tracker.is_stuck()
+        if stuck:
+            log.error(f"Loop detected: {stuck_msg}")
+            diag = write_diagnostic(
+                reason=f"State loop: {stuck_msg}",
+                session_num=session_num,
+                state_file=state_file,
+                log_dir=log_dir,
+                tracker=tracker,
+                audit_trail=audit_trail,
+                cost_usd=session_cost,
+                total_cost_usd=total_cost,
+            )
+            inject_escalation(state_file, f"Agent stuck — {stuck_msg}", diag)
+            print(f"\n⚠ Agent stuck — loop detected after session {session_num} ({elapsed}s)")
+            print(f"  {stuck_msg}")
+            print(f"  Diagnostic: {diag}\n")
+            print("━━━ State at pause ━━━")
+            if state_file.exists():
+                print(state_file.read_text())
+            finalize_run(2, "cross_session_state_loop", session_num)
+
+        # ── Handle stall/error ──
+        if stop_reason in ("stall", "error"):
+            if session_num >= args.n:
+                break  # let max-sessions handler deal with it
+            print(f"  Session ended with {stop_reason} — continuing to session {session_num + 1}...\n")
+            continue
+
+        if session_num < args.n:
+            print(f"  Task incomplete — continuing to session {session_num + 1}...\n")
+
+    # ── Max sessions exhausted ──
+    elapsed = int(time.time() - total_start)
+    print(f"\n✗ Task incomplete after {args.n} sessions ({elapsed}s, ${total_cost:.4f})\n")
+    if state_file.exists():
+        print("━━━ Progress so far ━━━")
+        print(state_file.read_text())
+
+    write_diagnostic(
+        reason=f"Max sessions ({args.n}) exceeded without completion",
+        session_num=args.n,
+        state_file=state_file,
+        log_dir=log_dir,
+        tracker=tracker,
+        cost_usd=0.0,
+        total_cost_usd=total_cost,
+    )
+    print(f"\nSession logs saved in: {log_dir}/")
+    finalize_run(1, "max_sessions_exhausted", args.n)
+
+
+def main():
+    asyncio.run(async_main())
+
+
+if __name__ == "__main__":
+    main()
