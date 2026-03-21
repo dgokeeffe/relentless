@@ -1490,6 +1490,12 @@ async def run_session(
         "cwd": os.getcwd(),
         "stderr": capture_stderr,
     }
+    # bypassPermissions: grant all tools explicitly via allowed_tools
+    if args.p == "bypassPermissions":
+        opts_kwargs["allowed_tools"] = [
+            "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+            "Agent", "NotebookEdit", "WebFetch", "WebSearch",
+        ]
     if system_cli:
         opts_kwargs["cli_path"] = system_cli
 
