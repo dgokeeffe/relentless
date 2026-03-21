@@ -22,7 +22,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -167,32 +166,39 @@ def run_task(
 
     # Run relentless with the template in place
     start = time.time()
-    with open(log_file, "w") as logf:
-        subprocess.run(
-            [
-                str(relentless_bin),
-                "-n", "1",
-                "-t", str(timeout_min),
-                "--no-adaptive",
-                "--no-checkpoint",
-                "-p", "auto",
-                "-s", str(state_file),
-                "--handoff-file", str(handoff_file),
-                "-d", str(task_dir),
-                "-f", str(task_file),
-            ],
-            stdout=logf,
-            stderr=subprocess.STDOUT,
-            env=env,
-            timeout=timeout_min * 60 + 30,  # small buffer
-        )
+    try:
+        with open(log_file, "w") as logf:
+            subprocess.run(
+                [
+                    str(relentless_bin),
+                    "-n", "1",
+                    "-t", str(timeout_min),
+                    "--no-adaptive",
+                    "--no-checkpoint",
+                    "-p", "bypassPermissions",
+                    "-s", str(state_file),
+                    "--handoff-file", str(handoff_file),
+                    "-d", str(task_dir),
+                    "-f", str(task_file),
+                ],
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                env=env,
+                timeout=timeout_min * 60 + 60,  # 1 min buffer for SDK teardown
+            )
+    except subprocess.TimeoutExpired:
+        pass  # Score whatever artifacts exist — timeout is a valid outcome
     return time.time() - start
 
 
 # ── Mutation ──────────────────────────────────────────────────
 
 def mutate_template(current_template: str, failure_analysis: str, cli_name: str) -> str | None:
-    """Use Claude to generate a single targeted mutation. Returns new template or None."""
+    """Use Claude CLI --print with prompt file to generate a single targeted mutation."""
+    # Truncate failure analysis to keep prompt manageable
+    if len(failure_analysis) > 1500:
+        failure_analysis = failure_analysis[:1500] + "\n...[truncated]"
+
     prompt = (
         "You are optimizing a system prompt template for an AI agent continuation loop. "
         "The template uses Python str.format_map() syntax: {variable} for substitution, "
@@ -201,8 +207,8 @@ def mutate_template(current_template: str, failure_analysis: str, cli_name: str)
         f"<failure_analysis>\n{failure_analysis}\n</failure_analysis>\n\n"
         "Make ONE targeted change to improve the template based on the failure analysis. "
         "Do not change multiple things at once. Keep all {variable} placeholders intact. "
-        "Return ONLY the complete modified template. No explanation, no markdown fences, "
-        "no preamble."
+        "Return ONLY the complete modified template — no explanation, no markdown fences, "
+        "no preamble, no conversational text."
     )
 
     env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
@@ -211,14 +217,17 @@ def mutate_template(current_template: str, failure_analysis: str, cli_name: str)
         result = subprocess.run(
             [cli_name, "--print", "-p", "-"],
             input=prompt,
-            capture_output=True, text=True, env=env, timeout=180,
+            capture_output=True, text=True, env=env, timeout=300,
         )
         if result.returncode != 0:
             print(f"  Mutation call failed: {result.stderr[:200]}")
             return None
         return result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        print(f"  Mutation call error: {exc}")
+    except subprocess.TimeoutExpired:
+        print(f"  Mutation timed out (300s)")
+        return None
+    except FileNotFoundError:
+        print(f"  CLI not found: {cli_name}")
         return None
 
 
@@ -298,7 +307,7 @@ def main():
     parser.add_argument("--tasks", type=Path, default=DEFAULT_TASKS, help="Test tasks JSON file")
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR, help="Output directory")
     parser.add_argument("--max-experiments", type=int, default=10, help="Max mutation cycles")
-    parser.add_argument("--timeout", type=int, default=3, help="Per-task timeout in minutes")
+    parser.add_argument("--timeout", type=int, default=5, help="Per-task timeout in minutes")
     parser.add_argument("--dry-run", action="store_true", help="Show config without running")
     parser.add_argument("--baseline-only", action="store_true", help="Run baseline and stop")
     args = parser.parse_args()

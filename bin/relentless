@@ -1416,12 +1416,13 @@ def build_prompt(
         return (
             f"# Task\n\n{task}\n\n"
             f"# Working directory: {os.getcwd()}\n\n"
-            f"Within your first 3 tool calls, initialize BOTH:\n"
-            f"- State markdown at `{state_file}`\n"
-            f"- Handoff JSON at `{handoff_file}`\n\n"
-            f"List acceptance criteria / steps as Remaining items and begin with one "
-            f"micro-objective. {ac_hint}\n"
-            f"When done, set state `STATUS: COMPLETE` and handoff `success=true, is_continue=false`."
+            f"# TRACKING (mandatory)\n\n"
+            f"Two tracking files exist and MUST be updated throughout this session:\n"
+            f"- **State file**: `{state_file}` — append `[STEP] <action> — <result>` after EVERY significant action\n"
+            f"- **Handoff JSON**: `{handoff_file}` — update `done`, `in_flight`, `next_step` after each step\n\n"
+            f"Read both files now to see their format. After completing the task, "
+            f"set state `STATUS: COMPLETE` and handoff `success=true, is_continue=false`.\n\n"
+            f"{ac_hint}"
         )
 
     return (
@@ -2076,6 +2077,36 @@ async def async_main():
             if exit_code == 0 and args.m:
                 save_last_success_model(log_dir, args.m)
         sys.exit(exit_code)
+
+    # ── Pre-seed state + handoff so the agent sees them from tool call 1 ──
+    if not state_file.exists():
+        ac_remaining = "\n".join(f"- {ac}" for ac in ac_ids) if ac_ids else "- (see task description)"
+        state_file.write_text(
+            f"STATUS: IN_PROGRESS\n\n"
+            f"## Completed\n\n"
+            f"## In Progress\nWorking on: initializing\n\n"
+            f"## Discoveries\n\n"
+            f"## Remaining\n{ac_remaining}\n\n"
+            f"## Blockers\n"
+        )
+    if not handoff_file.exists():
+        handoff_file.write_text(json.dumps({
+            "schema_version": HANDOFF_SCHEMA_VERSION,
+            "session": 0,
+            "goal": "",
+            "success": False,
+            "is_continue": False,
+            "summary": "pre-seeded by relentless engine",
+            "done": [],
+            "in_flight": "",
+            "next_step": "begin task",
+            "discoveries": [],
+            "blockers": [],
+            "artifact_refs": [],
+            "target_ac": ac_ids[0] if ac_ids else "",
+            "remaining_acs": ac_ids or [],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }, indent=2))
 
     for session_num in range(1, args.n + 1):
         print(f"━━━ Session {session_num}/{args.n} ━━━")

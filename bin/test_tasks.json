@@ -1,17 +1,17 @@
 [
   {
-    "id": "file-create",
-    "description": "Create a simple file — tests session-1 initialization and completion",
-    "task": "Create a file called /tmp/relentless-test-output.txt containing 'Hello from relentless'. Then mark the task complete."
+    "id": "refactor-module",
+    "description": "Multi-file refactor — tests step logging and state tracking across many edits",
+    "task": "Create a Python module at /tmp/relentless-test-refactor/. Step 1: Create /tmp/relentless-test-refactor/calculator.py with a Calculator class that has add, subtract, multiply, divide methods (divide should handle zero division). Step 2: Create /tmp/relentless-test-refactor/test_calculator.py with pytest tests for all 4 operations plus a zero-division test. Step 3: Run the tests with 'uv run pytest /tmp/relentless-test-refactor/test_calculator.py -v --no-header' and capture the output. Step 4: Create /tmp/relentless-test-refactor/RESULTS.md summarizing what was built and the test results. Log each step in the state file as you complete it."
   },
   {
-    "id": "multi-step",
-    "description": "Multi-step task — tests state tracking and step logging",
-    "task": "Do these 3 steps in order: (1) Create /tmp/relentless-step1.txt with contents 'step1'. (2) Create /tmp/relentless-step2.txt with contents 'step2'. (3) Create /tmp/relentless-step3.txt with contents 'step3'. Mark complete when all 3 exist."
+    "id": "analyze-and-report",
+    "description": "Read + analyze + write — tests discovery logging and multi-phase work",
+    "task": "Analyze the Python files in /tmp/relentless-test-refactor/ (created by a prior task — if missing, note that as a discovery and create a minimal calculator.py first). Step 1: Read each .py file and count lines of code, number of functions/methods, and number of classes. Step 2: Check for any potential issues (missing docstrings, bare except clauses, unused imports). Step 3: Write a report to /tmp/relentless-test-report.md with a table of file stats and a list of findings. Record any unexpected discoveries (e.g., files missing, syntax errors found). Mark complete when the report is written."
   },
   {
-    "id": "discovery-logging",
-    "description": "Task requiring a discovery — tests discovery logging in state/handoff",
-    "task": "Check if the file /etc/hostname exists. Note whether it exists or not as a discovery. Create /tmp/relentless-hostname.txt with the hostname value if it exists, or 'not-found' if it does not. Mark complete."
+    "id": "iterative-fix",
+    "description": "Fix-and-verify loop — tests state tracking through retry cycles",
+    "task": "Step 1: Create /tmp/relentless-test-bugfix/buggy.py with this exact content:\n\ndef process_items(items):\n    results = []\n    for item in items:\n        if item > 0:\n            results.append(item * 2)\n        elif item = 0:\n            results.append(0)\n        else:\n            results.append(abs(item))\n    return results\n\nStep 2: Create /tmp/relentless-test-bugfix/test_buggy.py with tests that call process_items with [1, -2, 0, 3, -5] and verify the output is [2, 2, 0, 6, 5]. Step 3: Run the tests — they should fail (there's a syntax error: 'elif item = 0' should be 'elif item == 0'). Log the failure as a discovery. Step 4: Fix the bug in buggy.py. Step 5: Re-run the tests and verify they pass. Log each step and the fix in the state file."
   }
 ]
