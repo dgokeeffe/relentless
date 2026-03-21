@@ -1,0 +1,17 @@
+[
+  {
+    "id": "file-create",
+    "description": "Create a simple file — tests session-1 initialization and completion",
+    "task": "Create a file called /tmp/relentless-test-output.txt containing 'Hello from relentless'. Then mark the task complete."
+  },
+  {
+    "id": "multi-step",
+    "description": "Multi-step task — tests state tracking and step logging",
+    "task": "Do these 3 steps in order: (1) Create /tmp/relentless-step1.txt with contents 'step1'. (2) Create /tmp/relentless-step2.txt with contents 'step2'. (3) Create /tmp/relentless-step3.txt with contents 'step3'. Mark complete when all 3 exist."
+  },
+  {
+    "id": "discovery-logging",
+    "description": "Task requiring a discovery — tests discovery logging in state/handoff",
+    "task": "Check if the file /etc/hostname exists. Note whether it exists or not as a discovery. Create /tmp/relentless-hostname.txt with the hostname value if it exists, or 'not-found' if it does not. Mark complete."
+  }
+]

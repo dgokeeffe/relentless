@@ -213,11 +213,21 @@ class StateTracker:
 class ToolLoopDetector:
     """Track (tool_name, hash(input)) pairs within a session to detect loops."""
 
-    def __init__(self, repeat_limit: int = TOOL_REPEAT_LIMIT):
+    def __init__(self, repeat_limit: int = TOOL_REPEAT_LIMIT, exempt_paths: set[str] | None = None):
         self.repeat_limit = repeat_limit
+        self.exempt_paths = exempt_paths or set()
         self.calls: dict[str, int] = {}  # "tool:input_hash" → count
         self.audit_trail: list[dict] = []
         self.total_calls = 0
+
+    def _is_exempt(self, tool_name: str, tool_input: dict) -> bool:
+        """Exempt writes to state/handoff files from loop detection."""
+        if not self.exempt_paths:
+            return False
+        if tool_name not in ("Write", "Edit"):
+            return False
+        target = tool_input.get("file_path", "")
+        return any(target.endswith(p) or target == p for p in self.exempt_paths)
 
     def record(self, tool_name: str, tool_input: dict) -> tuple[bool, str]:
         """Record a tool call. Returns (is_loop, description)."""
@@ -235,8 +245,12 @@ class ToolLoopDetector:
             "tool": tool_name,
             "input_hash": input_hash,
             "repeat_count": count,
+            "exempt": self._is_exempt(tool_name, tool_input),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
+
+        if self._is_exempt(tool_name, tool_input):
+            return False, ""
 
         if count >= self.repeat_limit:
             desc = (
@@ -874,6 +888,37 @@ def _make_test_args() -> argparse.Namespace:
     )
 
 
+def _test_tool_loop_detector_exempt_paths() -> None:
+    """Writes to state/handoff files should not trigger loop detection."""
+    detector = ToolLoopDetector(repeat_limit=3, exempt_paths={"/tmp/state.md", "/tmp/handoff.json"})
+
+    # Non-exempt Write should trigger after 3
+    for _ in range(2):
+        loop, _ = detector.record("Write", {"file_path": "/tmp/other.txt", "content": "x"})
+        assert not loop
+    loop, _ = detector.record("Write", {"file_path": "/tmp/other.txt", "content": "x"})
+    assert loop
+
+    # Exempt state file Write should never trigger
+    detector2 = ToolLoopDetector(repeat_limit=3, exempt_paths={"/tmp/state.md", "/tmp/handoff.json"})
+    for _ in range(5):
+        loop, _ = detector2.record("Write", {"file_path": "/tmp/state.md", "content": "STATUS: IN_PROGRESS"})
+        assert not loop
+
+    # Exempt handoff file Write should never trigger
+    for _ in range(5):
+        loop, _ = detector2.record("Write", {"file_path": "/tmp/handoff.json", "content": "{}"})
+        assert not loop
+
+    # Non-Write tools to exempt paths should still trigger
+    detector3 = ToolLoopDetector(repeat_limit=3, exempt_paths={"/tmp/state.md"})
+    for _ in range(2):
+        loop, _ = detector3.record("Read", {"file_path": "/tmp/state.md"})
+        assert not loop
+    loop, _ = detector3.record("Read", {"file_path": "/tmp/state.md"})
+    assert loop
+
+
 def _test_failure_signature_detector_loop() -> None:
     detector = FailureSignatureDetector(repeat_limit=2)
     loop, _ = detector.record("Error: database unavailable")
@@ -1040,14 +1085,46 @@ def _test_continuation_prompt_stays_compact() -> None:
         assert len(prompt) < 3500
 
 
+def _test_system_prompt_template_render():
+    """Verify template renders correctly in all modes."""
+    # Base mode — no escalate, no ACs
+    prompt = build_system_prompt(Path("/tmp/state.md"), Path("/tmp/handoff.json"))
+    assert "State file: /tmp/state.md" in prompt
+    assert "Handoff file: /tmp/handoff.json" in prompt
+    assert HANDOFF_SCHEMA_VERSION in prompt
+    assert "PRD MODE" not in prompt
+    assert "ACCEPTANCE CRITERIA" not in prompt
+    assert "{# IF" not in prompt  # no marker remnants
+
+    # PRD mode — escalate_rules present
+    prompt = build_system_prompt(
+        Path("/tmp/s.md"), Path("/tmp/h.json"),
+        escalate_rules="     - External API failure\n     - Budget exceeded",
+    )
+    assert "PRD MODE" in prompt
+    assert "External API failure" in prompt
+    assert "ACCEPTANCE CRITERIA" not in prompt
+
+    # AC mode — ac_ids present, no escalate
+    prompt = build_system_prompt(
+        Path("/tmp/s.md"), Path("/tmp/h.json"),
+        ac_ids=["AC-1", "AC-2", "AC-3"],
+    )
+    assert "AC-1, AC-2, AC-3" in prompt
+    assert "ACCEPTANCE CRITERIA" in prompt
+    assert "PRD MODE" not in prompt
+
+
 def run_self_tests() -> int:
     tests = [
+        ("tool_loop_detector_exempt_paths", _test_tool_loop_detector_exempt_paths),
         ("failure_signature_detector_loop", _test_failure_signature_detector_loop),
         ("failure_signature_detector_reset", _test_failure_signature_detector_reset),
         ("adaptive_tuning_profile_and_flags", _test_adaptive_tuning_profile_and_flags),
         ("handoff_normalization_enforces_size_and_schema", _test_handoff_normalization_enforces_size_and_schema),
         ("fallback_handoff_from_state", _test_fallback_handoff_from_state),
         ("continuation_prompt_stays_compact", _test_continuation_prompt_stays_compact),
+        ("system_prompt_template_render", _test_system_prompt_template_render),
     ]
 
     failures: list[str] = []
@@ -1119,15 +1196,55 @@ def inject_escalation(state_file: Path, reason: str, diag_path: Path):
 
 # ── System Prompt ─────────────────────────────────────────────
 
-def build_system_prompt(
-    state_file: Path,
-    handoff_file: Path,
-    escalate_rules: str = "",
-    ac_ids: list[str] | None = None,
-) -> str:
-    ac_list = ac_ids or []
-    ac_hint = ", ".join(ac_list[:8]) if ac_list else ""
-    prompt = f"""You are running inside a relentless auto-continuation loop. Your session has a
+_TEMPLATE_CACHE: str | None = None
+
+
+def _load_system_prompt_template() -> str:
+    """Load system_prompt.md from alongside this script; fall back to inline."""
+    global _TEMPLATE_CACHE
+    if _TEMPLATE_CACHE is not None:
+        return _TEMPLATE_CACHE
+
+    template_path = Path(__file__).resolve().parent / "system_prompt.md"
+    if template_path.exists():
+        _TEMPLATE_CACHE = template_path.read_text()
+        return _TEMPLATE_CACHE
+
+    log.warning("system_prompt.md not found beside script; using inline fallback")
+    _TEMPLATE_CACHE = _INLINE_SYSTEM_PROMPT
+    return _TEMPLATE_CACHE
+
+
+def _render_template(template: str, variables: dict) -> str:
+    """Render a system prompt template with conditional blocks and variable substitution."""
+    result = template
+
+    # Process conditional blocks: {# IF varname #}...{# ENDIF varname #}
+    for var_name in ("escalate_rules", "ac_hint"):
+        pattern = re.compile(
+            rf"\{{# IF {var_name} #\}}.*?\{{# ENDIF {var_name} #\}}\n?",
+            re.DOTALL,
+        )
+        if variables.get(var_name):
+            # Keep block content, strip markers
+            result = result.replace(f"{{# IF {var_name} #}}\n", "")
+            result = result.replace(f"{{# IF {var_name} #}}", "")
+            result = result.replace(f"{{# ENDIF {var_name} #}}\n", "")
+            result = result.replace(f"{{# ENDIF {var_name} #}}", "")
+        else:
+            # Remove entire block
+            result = pattern.sub("", result)
+
+    try:
+        return result.format_map(variables)
+    except (KeyError, ValueError) as exc:
+        log.warning(f"Template render failed ({exc}); using inline fallback")
+        return _render_template(_INLINE_SYSTEM_PROMPT, variables)
+
+
+# Inline fallback — kept for resilience if system_prompt.md is missing
+_INLINE_SYSTEM_PROMPT = """\
+You are running inside a relentless auto-continuation loop. Your session has a
 CONTEXT BUDGET. When it's exhausted you will be CUT OFF and a fresh session will continue
 from a compact handoff. The task/PRD is re-sent to every session, so you always have the plan.
 DO NOT rely on long in-memory context across sessions.
@@ -1168,7 +1285,7 @@ Write/update `{handoff_file}` at least every ~5 tool calls and before ending a s
 Keep it concise (bounded memory). Use this exact schema:
 
 ```json
-{{
+{{{{
   "schema_version": "{HANDOFF_SCHEMA_VERSION}",
   "session": <int>,
   "goal": "<one-line goal>",
@@ -1184,7 +1301,7 @@ Keep it concise (bounded memory). Use this exact schema:
   "target_ac": "<AC-id or empty>",
   "remaining_acs": ["<AC ids still open>"],
   "updated_at": "<ISO8601>"
-}}
+}}}}
 ```
 
 ## RULES
@@ -1228,28 +1345,28 @@ Keep it concise (bounded memory). Use this exact schema:
 
 11. HEARTBEAT: Update handoff every ~10 tool calls during long operations.
 
-12. SESSION FOCUS: Do one micro-objective per session. Prefer single-AC progress."""
+12. SESSION FOCUS: Do one micro-objective per session. Prefer single-AC progress.\
+"""
 
-    if escalate_rules:
-        prompt += f"""
 
-13. PRD MODE: This task comes from a Product Requirements Document.
-   - Use Acceptance Criteria as your completion checklist. Each AC must pass.
-   - Pick ONE `target_ac` per session and focus progress there before switching.
-   - Keep `remaining_acs` accurate in handoff after each test/edit cycle.
-   - Respect Non-Goals / out_of_scope — do NOT build anything excluded.
-   - Follow constraints.key_files and constraints.patterns.
-   - STOP and write ESCALATION for:
-{escalate_rules}
-   - Mark "STATUS: COMPLETE" only when ALL acceptance criteria are satisfied."""
-    elif ac_hint:
-        prompt += f"""
+def build_system_prompt(
+    state_file: Path,
+    handoff_file: Path,
+    escalate_rules: str = "",
+    ac_ids: list[str] | None = None,
+) -> str:
+    ac_list = ac_ids or []
+    ac_hint = ", ".join(ac_list[:8]) if ac_list else ""
 
-13. ACCEPTANCE CRITERIA DISCIPLINE:
-   - Known AC IDs: {ac_hint}
-   - Keep `target_ac` and `remaining_acs` in sync with your progress."""
+    template = _load_system_prompt_template()
 
-    return prompt
+    return _render_template(template, {
+        "state_file": str(state_file),
+        "handoff_file": str(handoff_file),
+        "HANDOFF_SCHEMA_VERSION": HANDOFF_SCHEMA_VERSION,
+        "escalate_rules": escalate_rules,
+        "ac_hint": ac_hint,
+    })
 
 
 # ── PRD Detection ─────────────────────────────────────────────
@@ -1340,7 +1457,11 @@ async def run_session(
     stop_reason: "complete" | "incomplete" | "loop_detected" | "stall" |
                  "context_limit" | "error"
     """
-    loop_detector = ToolLoopDetector(repeat_limit=args.tool_repeat_limit)
+    # Exempt state/handoff files from loop detection — the agent is expected
+    # to write these repeatedly with similar content as part of the protocol.
+    handoff_file = default_handoff_file_for_state(state_file)
+    exempt = {str(state_file), str(handoff_file)}
+    loop_detector = ToolLoopDetector(repeat_limit=args.tool_repeat_limit, exempt_paths=exempt)
     failure_detector = FailureSignatureDetector(repeat_limit=args.failure_repeat_limit)
     context_budget = ContextBudget(
         max_turns=args.max_turns,

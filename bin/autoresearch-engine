@@ -1,0 +1,531 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""autoresearch-engine — optimize the relentless system prompt via experiment loop.
+
+Runs relentless on cheap canonical tasks, scores artifacts against binary evals,
+mutates the system prompt template, and keeps improvements.
+
+Usage:
+  autoresearch-engine                          # Run with defaults
+  autoresearch-engine --max-experiments 5      # Limit experiments
+  autoresearch-engine --dry-run                # Show config without running
+  autoresearch-engine --baseline-only          # Run baseline and stop
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Defaults ──────────────────────────────────────────────────
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_TEMPLATE = SCRIPT_DIR / "system_prompt.md"
+DEFAULT_TASKS = SCRIPT_DIR / "test_tasks.json"
+DEFAULT_RESULTS_DIR = SCRIPT_DIR / "autoresearch-results"
+RELENTLESS_BIN = SCRIPT_DIR / "relentless"
+
+# Required placeholders that must survive mutation
+REQUIRED_PLACEHOLDERS = {
+    "{state_file}",
+    "{handoff_file}",
+    "{HANDOFF_SCHEMA_VERSION}",
+}
+
+
+# ── Evals ─────────────────────────────────────────────────────
+
+def eval_state_file_initialized(state_text: str, _handoff: dict | None, _task: dict) -> bool:
+    """State file exists and has a valid STATUS line."""
+    if not state_text:
+        return False
+    return bool(re.search(r"^STATUS:\s*(IN_PROGRESS|COMPLETE|ESCALATION)", state_text, re.MULTILINE))
+
+
+def eval_handoff_json_valid(_state_text: str, handoff: dict | None, _task: dict) -> bool:
+    """Handoff JSON is parseable and has all required keys."""
+    if handoff is None:
+        return False
+    required = {
+        "schema_version", "session", "goal", "success", "is_continue",
+        "summary", "done", "in_flight", "next_step", "discoveries",
+        "blockers", "artifact_refs", "target_ac", "remaining_acs", "updated_at",
+    }
+    return required.issubset(set(handoff.keys()))
+
+
+def eval_task_completed(state_text: str, handoff: dict | None, _task: dict) -> bool:
+    """Agent reported task completion via both state and handoff."""
+    if handoff is None:
+        return False
+    return (
+        handoff.get("success") is True
+        and handoff.get("is_continue") is False
+        and "STATUS: COMPLETE" in state_text.upper()
+    )
+
+
+def eval_step_logging(state_text: str, _handoff: dict | None, _task: dict) -> bool:
+    """State file contains [STEP] progress entries."""
+    return bool(re.search(r"\[STEP\]", state_text))
+
+
+def eval_discoveries_populated(_state_text: str, handoff: dict | None, task: dict) -> bool:
+    """For discovery tasks, handoff.discoveries is non-empty. Auto-pass for others."""
+    if task.get("id") != "discovery-logging":
+        return True  # auto-pass
+    if handoff is None:
+        return False
+    discoveries = handoff.get("discoveries", [])
+    return (
+        isinstance(discoveries, list)
+        and len(discoveries) > 0
+        and any(d.strip() for d in discoveries if isinstance(d, str))
+    )
+
+
+EVALS = [
+    ("state_file_initialized", eval_state_file_initialized),
+    ("handoff_json_valid", eval_handoff_json_valid),
+    ("task_completed", eval_task_completed),
+    ("step_logging", eval_step_logging),
+    ("discoveries_populated", eval_discoveries_populated),
+]
+
+
+# ── Scoring ───────────────────────────────────────────────────
+
+def score_task(state_path: Path, handoff_path: Path, task: dict) -> dict[str, bool]:
+    """Score a single task run against all evals."""
+    state_text = state_path.read_text() if state_path.exists() else ""
+
+    handoff = None
+    if handoff_path.exists():
+        try:
+            handoff = json.loads(handoff_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return {name: fn(state_text, handoff, task) for name, fn in EVALS}
+
+
+def score_experiment(exp_dir: Path, tasks: list[dict]) -> tuple[int, int, dict[str, int]]:
+    """Score all tasks in an experiment. Returns (score, max_score, per_eval_counts)."""
+    total = 0
+    max_score = len(EVALS) * len(tasks)
+    per_eval: dict[str, int] = {name: 0 for name, _ in EVALS}
+
+    for task in tasks:
+        task_dir = exp_dir / task["id"]
+        state_path = task_dir / "state.md"
+        handoff_path = task_dir / "handoff.json"
+        results = score_task(state_path, handoff_path, task)
+        for name, passed in results.items():
+            if passed:
+                total += 1
+                per_eval[name] += 1
+
+    return total, max_score, per_eval
+
+
+# ── Running relentless ────────────────────────────────────────
+
+def run_task(
+    task: dict,
+    template_path: Path,
+    task_dir: Path,
+    relentless_bin: Path,
+    timeout_min: int = 3,
+) -> float:
+    """Run relentless on a single task. Returns elapsed seconds."""
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write task to temp file
+    task_file = task_dir / "task.txt"
+    task_file.write_text(task["task"])
+
+    state_file = task_dir / "state.md"
+    handoff_file = task_dir / "handoff.json"
+    log_file = task_dir / "relentless.log"
+
+    # Clean artifacts from prior runs
+    for f in (state_file, handoff_file):
+        f.unlink(missing_ok=True)
+
+    # Build env — strip nesting guards
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
+
+    # Run relentless with the template in place
+    start = time.time()
+    with open(log_file, "w") as logf:
+        subprocess.run(
+            [
+                str(relentless_bin),
+                "-n", "1",
+                "-t", str(timeout_min),
+                "--no-adaptive",
+                "--no-checkpoint",
+                "-p", "auto",
+                "-s", str(state_file),
+                "--handoff-file", str(handoff_file),
+                "-d", str(task_dir),
+                "-f", str(task_file),
+            ],
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            env=env,
+            timeout=timeout_min * 60 + 30,  # small buffer
+        )
+    return time.time() - start
+
+
+# ── Mutation ──────────────────────────────────────────────────
+
+def mutate_template(current_template: str, failure_analysis: str, cli_name: str) -> str | None:
+    """Use Claude to generate a single targeted mutation. Returns new template or None."""
+    prompt = (
+        "You are optimizing a system prompt template for an AI agent continuation loop. "
+        "The template uses Python str.format_map() syntax: {variable} for substitution, "
+        "{{ and }} for literal braces. Conditional blocks use {# IF var #} / {# ENDIF var #}.\n\n"
+        f"<current_template>\n{current_template}\n</current_template>\n\n"
+        f"<failure_analysis>\n{failure_analysis}\n</failure_analysis>\n\n"
+        "Make ONE targeted change to improve the template based on the failure analysis. "
+        "Do not change multiple things at once. Keep all {variable} placeholders intact. "
+        "Return ONLY the complete modified template. No explanation, no markdown fences, "
+        "no preamble."
+    )
+
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")}
+
+    try:
+        result = subprocess.run(
+            [cli_name, "--print", "-p", "-"],
+            input=prompt,
+            capture_output=True, text=True, env=env, timeout=180,
+        )
+        if result.returncode != 0:
+            print(f"  Mutation call failed: {result.stderr[:200]}")
+            return None
+        return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        print(f"  Mutation call error: {exc}")
+        return None
+
+
+def validate_template(template: str) -> bool:
+    """Check that required placeholders survived mutation."""
+    for placeholder in REQUIRED_PLACEHOLDERS:
+        if placeholder not in template:
+            return False
+    return True
+
+
+# ── Failure analysis ──────────────────────────────────────────
+
+def analyze_failures(exp_dir: Path, tasks: list[dict]) -> str:
+    """Build a failure analysis from the last experiment's artifacts."""
+    lines = []
+    for task in tasks:
+        task_dir = exp_dir / task["id"]
+        state_path = task_dir / "state.md"
+        handoff_path = task_dir / "handoff.json"
+        results = score_task(state_path, handoff_path, task)
+        failures = [name for name, passed in results.items() if not passed]
+        if failures:
+            state_preview = ""
+            if state_path.exists():
+                state_preview = state_path.read_text()[:500]
+            handoff_preview = ""
+            if handoff_path.exists():
+                handoff_preview = handoff_path.read_text()[:500]
+            lines.append(f"Task '{task['id']}' failed evals: {', '.join(failures)}")
+            if state_preview:
+                lines.append(f"  State file preview: {state_preview}")
+            if handoff_preview:
+                lines.append(f"  Handoff preview: {handoff_preview}")
+    return "\n".join(lines) if lines else "All evals passed."
+
+
+# ── Results I/O ───────────────────────────────────────────────
+
+def append_tsv(path: Path, experiment: int, score: int, max_score: int, status: str, description: str):
+    """Append a row to results.tsv."""
+    rate = f"{score / max_score * 100:.1f}%"
+    if not path.exists():
+        path.write_text("experiment\tscore\tmax_score\tpass_rate\tstatus\tdescription\n")
+    with open(path, "a") as f:
+        f.write(f"{experiment}\t{score}\t{max_score}\t{rate}\t{status}\t{description}\n")
+
+
+def write_results_json(path: Path, data: dict):
+    """Write the results.json dashboard data."""
+    path.write_text(json.dumps(data, indent=2))
+
+
+def append_changelog(path: Path, experiment: int, score: int, max_score: int, status: str, change: str, reasoning: str, result_detail: str):
+    """Append an experiment entry to changelog.md."""
+    rate = f"{score / max_score * 100:.1f}%"
+    entry = (
+        f"\n## Experiment {experiment} — {status}\n\n"
+        f"**Score:** {score}/{max_score} ({rate})\n"
+        f"**Change:** {change}\n"
+        f"**Reasoning:** {reasoning}\n"
+        f"**Result:** {result_detail}\n"
+    )
+    with open(path, "a") as f:
+        f.write(entry)
+
+
+# ── Main ──────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Optimize relentless system prompt via autoresearch",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--template", type=Path, default=DEFAULT_TEMPLATE, help="System prompt template")
+    parser.add_argument("--tasks", type=Path, default=DEFAULT_TASKS, help="Test tasks JSON file")
+    parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR, help="Output directory")
+    parser.add_argument("--max-experiments", type=int, default=10, help="Max mutation cycles")
+    parser.add_argument("--timeout", type=int, default=3, help="Per-task timeout in minutes")
+    parser.add_argument("--dry-run", action="store_true", help="Show config without running")
+    parser.add_argument("--baseline-only", action="store_true", help="Run baseline and stop")
+    args = parser.parse_args()
+
+    # Validate inputs
+    if not args.template.exists():
+        print(f"Error: Template not found: {args.template}", file=sys.stderr)
+        sys.exit(1)
+    if not args.tasks.exists():
+        print(f"Error: Tasks file not found: {args.tasks}", file=sys.stderr)
+        sys.exit(1)
+    if not RELENTLESS_BIN.exists():
+        print(f"Error: relentless binary not found: {RELENTLESS_BIN}", file=sys.stderr)
+        sys.exit(1)
+
+    cli_name = shutil.which("claude") or shutil.which("isaac") or "claude"
+    tasks = json.loads(args.tasks.read_text())
+    template_text = args.template.read_text()
+    results_dir = args.results_dir
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    tsv_path = results_dir / "results.tsv"
+    json_path = results_dir / "results.json"
+    changelog_path = results_dir / "changelog.md"
+
+    # Banner
+    print("╔══════════════════════════════════════════════════╗")
+    print("║  autoresearch-engine — system prompt optimizer   ║")
+    print("╠══════════════════════════════════════════════════╣")
+    print(f"║  Template:       {args.template}")
+    print(f"║  Tasks:          {len(tasks)} tasks from {args.tasks.name}")
+    print(f"║  Evals:          {len(EVALS)} binary checks")
+    print(f"║  Max score:      {len(EVALS) * len(tasks)} ({len(EVALS)} evals × {len(tasks)} tasks)")
+    print(f"║  Max experiments: {args.max_experiments}")
+    print(f"║  Timeout:        {args.timeout}m per task")
+    print(f"║  Results:        {results_dir}/")
+    print(f"║  CLI:            {cli_name}")
+    print("╚══════════════════════════════════════════════════╝")
+
+    if args.dry_run:
+        print("\n[DRY RUN] Would run:")
+        for task in tasks:
+            print(f"  - {task['id']}: {task['description']}")
+        print(f"\nEvals: {', '.join(name for name, _ in EVALS)}")
+        sys.exit(0)
+
+    # Save baseline template
+    baseline_path = results_dir / "system_prompt.md.baseline"
+    baseline_path.write_text(template_text)
+
+    # Dashboard data
+    dashboard = {
+        "template": str(args.template),
+        "status": "running",
+        "current_experiment": 0,
+        "baseline_score": 0.0,
+        "best_score": 0.0,
+        "experiments": [],
+        "eval_breakdown": [],
+    }
+
+    # ── Baseline (experiment 0) ──
+    print("\n━━━ Experiment 0: Baseline ━━━")
+    exp_dir = results_dir / "exp_000"
+    total_elapsed = 0.0
+
+    for task in tasks:
+        task_dir = exp_dir / task["id"]
+        print(f"  Running: {task['id']}...", end=" ", flush=True)
+        elapsed = run_task(task, args.template, task_dir, RELENTLESS_BIN, args.timeout)
+        total_elapsed += elapsed
+        print(f"done ({elapsed:.0f}s)")
+
+    score, max_score, per_eval = score_experiment(exp_dir, tasks)
+    rate = score / max_score * 100
+    print(f"\n  Baseline score: {score}/{max_score} ({rate:.1f}%)")
+    for name, count in per_eval.items():
+        status = "✓" if count == len(tasks) else f"{count}/{len(tasks)}"
+        print(f"    {name}: {status}")
+
+    append_tsv(tsv_path, 0, score, max_score, "baseline", "original system prompt — no changes")
+    dashboard["baseline_score"] = rate
+    dashboard["best_score"] = rate
+    dashboard["experiments"].append({
+        "id": 0, "score": score, "max_score": max_score,
+        "pass_rate": rate, "status": "baseline",
+        "description": "original system prompt — no changes",
+    })
+    dashboard["eval_breakdown"] = [
+        {"name": name, "pass_count": count, "total": len(tasks)}
+        for name, count in per_eval.items()
+    ]
+    write_results_json(json_path, dashboard)
+
+    # Initialize changelog
+    changelog_path.write_text(f"# Autoresearch Engine Changelog\n\nTemplate: `{args.template.name}`\nStarted: {datetime.now(timezone.utc).isoformat()}\n")
+    append_changelog(
+        changelog_path, 0, score, max_score, "baseline",
+        "N/A", "Establishing baseline",
+        f"Per-eval: {', '.join(f'{n}={c}/{len(tasks)}' for n, c in per_eval.items())}",
+    )
+
+    if args.baseline_only:
+        dashboard["status"] = "complete"
+        write_results_json(json_path, dashboard)
+        print("\n[baseline-only] Done.")
+        sys.exit(0)
+
+    if rate >= 95:
+        print(f"\n  Baseline already at {rate:.1f}% — may not need optimization.")
+
+    # ── Experiment loop ──
+    best_score = score
+    best_template = template_text
+    consecutive_ceiling = 0
+
+    for exp_num in range(1, args.max_experiments + 1):
+        print(f"\n━━━ Experiment {exp_num}/{args.max_experiments} ━━━")
+
+        # Analyze failures from previous experiment
+        prev_dir = results_dir / f"exp_{exp_num - 1:03d}"
+        failure_report = analyze_failures(prev_dir, tasks)
+
+        if failure_report == "All evals passed.":
+            print("  All evals passing — trying refinement mutation.")
+            failure_report = (
+                "All evals pass but we want to reinforce the patterns that work. "
+                "Look for instructions that could be made more concise or clear without "
+                "losing their effect."
+            )
+
+        # Mutate
+        print("  Generating mutation...", end=" ", flush=True)
+        mutated = mutate_template(best_template, failure_report, cli_name)
+        if mutated is None:
+            print("failed — skipping experiment.")
+            append_tsv(tsv_path, exp_num, best_score, max_score, "skip", "mutation generation failed")
+            continue
+
+        if not validate_template(mutated):
+            print("invalid — mutation broke required placeholders, discarding.")
+            append_tsv(tsv_path, exp_num, best_score, max_score, "discard", "mutation removed required placeholders")
+            continue
+        print("done.")
+
+        # Apply mutation to template file
+        args.template.write_text(mutated)
+
+        # Clear template cache in case relentless is imported (shouldn't be, but defensive)
+        exp_dir = results_dir / f"exp_{exp_num:03d}"
+
+        for task in tasks:
+            task_dir = exp_dir / task["id"]
+            print(f"  Running: {task['id']}...", end=" ", flush=True)
+            elapsed = run_task(task, args.template, task_dir, RELENTLESS_BIN, args.timeout)
+            print(f"done ({elapsed:.0f}s)")
+
+        new_score, _, new_per_eval = score_experiment(exp_dir, tasks)
+        new_rate = new_score / max_score * 100
+
+        # Compute diff summary
+        diff_lines = []
+        for old_line, new_line in zip(best_template.splitlines(), mutated.splitlines()):
+            if old_line != new_line:
+                diff_lines.append(f"-{old_line[:80]}")
+                diff_lines.append(f"+{new_line[:80]}")
+        change_desc = diff_lines[1][1:] if len(diff_lines) >= 2 else "subtle wording change"
+
+        if new_score > best_score:
+            status = "keep"
+            best_score = new_score
+            best_template = mutated
+            consecutive_ceiling = 0
+            print(f"  KEEP — {new_score}/{max_score} ({new_rate:.1f}%) ↑ from {score}/{max_score}")
+        elif new_score == best_score and new_rate >= 95:
+            status = "keep"
+            best_template = mutated
+            consecutive_ceiling += 1
+            print(f"  KEEP (same score, simpler) — {new_score}/{max_score} ({new_rate:.1f}%)")
+        else:
+            status = "discard"
+            args.template.write_text(best_template)  # revert
+            consecutive_ceiling = 0 if new_rate < 95 else consecutive_ceiling + 1
+            print(f"  DISCARD — {new_score}/{max_score} ({new_rate:.1f}%) vs best {best_score}/{max_score}")
+
+        for name, count in new_per_eval.items():
+            flag = "✓" if count == len(tasks) else f"{count}/{len(tasks)}"
+            print(f"    {name}: {flag}")
+
+        append_tsv(tsv_path, exp_num, new_score, max_score, status, change_desc[:100])
+        dashboard["current_experiment"] = exp_num
+        dashboard["best_score"] = max(dashboard["best_score"], new_rate)
+        dashboard["experiments"].append({
+            "id": exp_num, "score": new_score, "max_score": max_score,
+            "pass_rate": new_rate, "status": status,
+            "description": change_desc[:100],
+        })
+        dashboard["eval_breakdown"] = [
+            {"name": name, "pass_count": count, "total": len(tasks)}
+            for name, count in new_per_eval.items()
+        ]
+        write_results_json(json_path, dashboard)
+
+        append_changelog(
+            changelog_path, exp_num, new_score, max_score, status,
+            change_desc[:200], failure_report[:200],
+            f"Per-eval: {', '.join(f'{n}={c}/{len(tasks)}' for n, c in new_per_eval.items())}",
+        )
+
+        # Stop if at ceiling for 3 consecutive experiments
+        if consecutive_ceiling >= 3:
+            print(f"\n  At ceiling ({new_rate:.1f}%) for 3 experiments — stopping.")
+            break
+
+    # ── Final report ──
+    dashboard["status"] = "complete"
+    write_results_json(json_path, dashboard)
+
+    baseline_score_pct = dashboard["baseline_score"]
+    final_score_pct = best_score / max_score * 100
+    print(f"\n{'═' * 50}")
+    print(f"  Baseline: {baseline_score_pct:.1f}% → Final: {final_score_pct:.1f}%")
+    print(f"  Experiments: {dashboard['current_experiment']}")
+    print(f"  Results: {results_dir}/")
+    print(f"  Template: {args.template}")
+    print(f"{'═' * 50}")
+
+
+if __name__ == "__main__":
+    main()
