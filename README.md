@@ -1,8 +1,32 @@
 # relentless
 
-Auto-continuing Claude Code agent with TDD pipeline, loop detection, cost tracking, and adaptive tuning.
+Claude Code sessions die at the context limit and you lose everything. Relentless fixes that.
 
-`relentless` wraps the [Claude Agent SDK](https://github.com/anthropics/claude-code-sdk-python) to run headless Claude Code sessions that automatically continue across context limits, detect when they're stuck, and track costs — while retaining access to all Claude Code tools, skills, and MCP servers.
+It wraps the [Claude Agent SDK](https://github.com/anthropics/claude-code-sdk-python) to run headless Claude Code sessions that automatically continue across context limits, detect when they're stuck, and track costs — while retaining access to all Claude Code tools, skills, and MCP servers.
+
+## Why use relentless
+
+**Sessions that don't stop.** Give it a task, walk away, come back to finished work. When context fills up, it checkpoints progress and starts a fresh session that picks up where the last one left off. No manual "here's what I did so far."
+
+**Loop detection.** Without relentless, a stuck agent burns your API budget retrying the same failing approach forever. Relentless catches this — both within a session (same tool call 3x) and across sessions (identical state 2x) — and escalates instead of wasting money.
+
+**Cost tracking.** See exactly what each session cost. Set budget caps. No surprise bills from a runaway agent.
+
+**Crash recovery.** Everything is on disk — `_relentless_state.md`, `_relentless_handoff.json`. If the process dies, `relentless -c` resumes from the last checkpoint. Nothing lives only in the conversation.
+
+**The TDD pipeline.** PRD → gate tests → implement → validate → remediate. Each phase runs in fresh context so there's no drift. The orchestrator chains them and the circuit breaker stops if it's not making progress. You go from "I have an idea" to "tests pass, app works" without babysitting.
+
+### When to use it
+
+- Task takes more than ~10 minutes of agent work
+- You want to fire-and-forget (background execution)
+- You're implementing from a PRD with multiple acceptance criteria
+- You've been burned by context limits mid-task before
+
+### When it's overkill
+
+- Quick questions, small edits, one-file changes
+- Anything you'd finish in one Claude Code session anyway
 
 ## Install
 
@@ -16,11 +40,15 @@ This gives you all the slash commands (`/relentless-prd`, `/relentless-implement
 
 ### CLI only
 
-Copy the `bin/relentless` script to your PATH:
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/dgokeeffe/relentless/main/bin/relentless -o ~/.local/bin/relentless
 chmod +x ~/.local/bin/relentless
+```
+
+Also grab the system prompt template:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dgokeeffe/relentless/main/bin/system_prompt.md -o ~/.local/bin/system_prompt.md
 ```
 
 Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv). Dependencies (`claude-agent-sdk>=0.1.37`) are resolved automatically via uv's inline script metadata.
@@ -31,10 +59,10 @@ Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv). Dependencies (`
 # Simple task
 relentless "Refactor the auth module to use JWT tokens"
 
-# From a file
-relentless -f task.md
+# From a PRD file
+relentless -f prd_jwt-auth.md
 
-# With options
+# More sessions, specific model, verbose
 relentless -n 8 -m opus -b 3.0 -v "Build the feature described in PRD.md"
 
 # Continue from where you left off
@@ -44,7 +72,7 @@ relentless -c "Keep going"
 echo "Fix all lint errors" | relentless
 ```
 
-## CLI options
+## CLI reference
 
 ```
 relentless [OPTIONS] "TASK"
@@ -66,7 +94,16 @@ relentless [OPTIONS] "TASK"
   --failure-repeat-limit N  Same failing tool-result N times = loop
   --adaptive / --no-adaptive  Enable/disable adaptive tuning
   --adaptive-profile MODE  conservative | balanced | aggressive
+  --self-test      Run built-in self-tests and exit
 ```
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Task completed successfully |
+| 1 | Max sessions exhausted without completion |
+| 2 | Escalation — stuck, looping, or unresolvable blocker |
 
 ## How it works
 
@@ -77,32 +114,74 @@ Session 1                    Session 2                    Session N
 │ (Agent SDK)      │        │ (Agent SDK)      │        │ (Agent SDK)      │
 │                  │        │                  │        │                  │
 │ ┌──────────────┐ │        │ ┌──────────────┐ │        │ ┌──────────────┐ │
-│ │ Tool Loop    │ │        │ │ Tool Loop    │ │        │ │ Tool Loop    │ │
+│ │ Loop         │ │        │ │ Loop         │ │        │ │ Loop         │ │
 │ │ Detector     │ │        │ │ Detector     │ │        │ │ Detector     │ │
 │ └──────────────┘ │        │ └──────────────┘ │        │ └──────────────┘ │
 │                  │        │                  │        │                  │
-│ ► tools, skills, │        │ ► tools, skills, │        │ ► tools, skills, │
-│   MCP servers    │        │   MCP servers    │        │   MCP servers    │
+│ ► all tools,     │        │ ► all tools,     │        │ ► all tools,     │
+│   skills, MCPs   │        │   skills, MCPs   │        │   skills, MCPs   │
 └────────┬─────────┘        └────────┬─────────┘        └────────┬─────────┘
          │                           │                           │
          ▼                           ▼                           ▼
    _relentless_state.md ──────► _relentless_state.md ──────► _relentless_state.md
-   (progress checkpoint)        (progress checkpoint)        (final state)
+   _relentless_handoff.json     _relentless_handoff.json     _relentless_handoff.json
 ```
 
 Each session runs Claude Code via the Agent SDK with full tool access. Between sessions, relentless:
 
-1. **Checks for completion** — did the agent signal it's done?
-2. **Detects loops** — is the state file identical to the last session? (MD5 hash comparison, threshold: 2 identical hashes)
+1. **Checks for completion** — did the agent set `STATUS: COMPLETE` and `success: true`?
+2. **Detects loops** — is the state file identical to the last session? (MD5 hash, threshold: 2)
 3. **Tracks costs** — accumulates `total_cost_usd` across sessions
-4. **Hands off context** — writes a continuation prompt with the state file so the next session picks up where the last left off
+4. **Hands off context** — writes a compact handoff JSON so the next session picks up exactly where the last one stopped
+
+### State file format
+
+The agent maintains a markdown state file throughout each session:
+
+```markdown
+STATUS: COMPLETE
+
+## Completed
+[STEP] Created calculator.py — Calculator class with add/subtract/multiply/divide
+[STEP] Created test_calculator.py — 5 pytest tests
+[STEP] Ran tests via uv run --with pytest — 5 passed
+
+## In Progress
+Working on: complete
+
+## Discoveries
+- Environment is uv-managed; must use uv run --with pytest instead of pip install
+
+## Remaining
+
+## Blockers
+```
+
+The handoff JSON is a compact structured summary:
+
+```json
+{
+  "schema_version": "1.0",
+  "session": 1,
+  "goal": "Create Calculator module and pytest tests, run them",
+  "success": true,
+  "is_continue": false,
+  "summary": "Created calculator.py, test_calculator.py, ran tests — 5 passed.",
+  "done": ["Created calculator.py", "Created test_calculator.py", "Ran tests"],
+  "in_flight": "",
+  "next_step": "",
+  "discoveries": ["uv-managed env; use uv run --with pytest"],
+  "remaining_acs": [],
+  "updated_at": "2026-03-21T22:18:19Z"
+}
+```
 
 ### Loop detection
 
 Two layers prevent wasted compute:
 
-- **Intra-session** (`ToolLoopDetector`): Hashes `(tool_name, input_hash)` pairs. If the same tool call repeats 3 times in a session, it escalates.
-- **Cross-session** (`StateTracker`): MD5-hashes the state file after each session. If 2 consecutive sessions produce identical state, the agent is stuck and relentless stops with exit code 2.
+- **Intra-session** (`ToolLoopDetector`): Hashes `(tool_name, input_hash)` pairs. Same tool call 3 times in a session → escalate. Writes to state/handoff files are exempt (they're expected to repeat).
+- **Cross-session** (`StateTracker`): MD5-hashes the state file after each session. 2 consecutive identical states → agent is stuck, exit code 2.
 
 ### Adaptive tuning
 
@@ -116,12 +195,22 @@ Relentless analyzes run history to adjust parameters automatically:
 
 Enable with `--adaptive` (on by default). Override with `--adaptive-profile`.
 
-## TDD Pipeline (plugin skills)
+### Context handoff
+
+When a session approaches its context budget (75% warning, 90% hard limit), relentless:
+
+1. Signals the agent to wrap up
+2. Runs an optional checkpoint micro-session to finalize the state/handoff files
+3. Starts a fresh session with the task + handoff as the prompt
+
+The next session reads the handoff JSON first, then the state file, and resumes from `next_step`.
+
+## TDD pipeline
 
 When installed as a Claude Code plugin, relentless includes a full TDD pipeline:
 
 ```
-/relentless-preflight  → validate environment, write config
+/relentless-preflight  → validate environment, write _relentless_config.json
          ↓
 /relentless-prd        → interactive PRD with machine-verifiable acceptance criteria
          ↓
@@ -138,39 +227,66 @@ When installed as a Claude Code plugin, relentless includes a full TDD pipeline:
 
 ### Skills
 
-| Skill | Description |
+| Skill | What it does |
 |-------|-------------|
-| `relentless-preflight` | Environment validation. Checks deps, ports, profiles, PRD structure. Writes `_relentless_config.json`. |
-| `relentless-prd` | Interactive PRD generator. Outputs markdown with Given/When/Then acceptance criteria and machine-readable Agent Handoff JSON. |
-| `relentless-gates` | TDD gate test generator. Reads PRD, outputs failing pytest/vitest stubs + `_gates.json` manifest. |
-| `relentless-implement` | Launches relentless CLI to implement a PRD or task. Runs in background with progress tracking. |
-| `relentless-validate` | Pure QA agent. Hits APIs, opens browser routes, captures errors. Never writes code. Outputs `_validation_report.json`. |
-| `relentless-remediate` | Targeted code fixer. Reads validation report, patches auto-fixable errors only. One error = one fix. |
-| `relentless-orchestrate` | Master orchestrator. Chains implement → validate → remediate → re-validate with fresh context per phase and circuit breaker. |
-| `relentless-devloop` | Browser testing via Chrome DevTools MCP. Navigation, screenshots, console/network error capture. |
-| `autoresearch` | Autonomous skill optimization. Runs a skill repeatedly, scores against binary evals, mutates the prompt, keeps improvements. |
+| `/relentless-preflight` | Validates environment (deps, ports, profiles, PRD structure). Writes `_relentless_config.json` — the contract between all phases. Catches config issues in 30 seconds before the pipeline burns budget. |
+| `/relentless-prd` | Interactive PRD generator. Asks clarifying questions, researches the codebase, outputs markdown with Given/When/Then acceptance criteria and a machine-readable Agent Handoff JSON block. |
+| `/relentless-gates` | Reads the PRD's Agent Handoff, generates one failing test stub per acceptance criterion (pytest for backend, vitest for frontend). Enriches stubs with real imports and assertion shapes from existing code. Outputs `_gates.json` manifest. |
+| `/relentless-implement` | Launches the relentless CLI in the background to implement a PRD or task. Defaults: 5 sessions, verbose, bypass permissions. Reports results when done. |
+| `/relentless-validate` | Pure QA — never writes code. Starts the app, hits API endpoints, opens browser routes via Chrome DevTools MCP, captures console errors and network failures. Categorizes each error (config/runtime/permission/auth) and writes `_validation_report.json`. |
+| `/relentless-remediate` | Reads the validation report. Patches auto-fixable errors only (config, runtime). One error = one fix. Never validates its own work. |
+| `/relentless-orchestrate` | Master coordinator. Runs implement → validate → remediate → re-validate in a loop with fresh context per phase. Circuit breaker stops after 3 loops if error count isn't decreasing. |
+| `/relentless-devloop` | Browser testing via Chrome DevTools MCP. Navigates routes, takes screenshots, captures console/network errors. Returns structured JSON for the validator. |
+| `/autoresearch` | Autonomous skill optimization. Runs any skill repeatedly, scores outputs against binary evals, mutates the prompt, keeps improvements. Based on Karpathy's autoresearch methodology. |
 
 ### Pipeline principles
 
-- **Fresh context per phase** — each phase runs in an isolated subagent. No accumulated drift.
-- **No agent judges its own output** — implementer doesn't validate, validator doesn't fix, remediator doesn't verify.
-- **Artifacts on disk are the only persistence** — `_relentless_state.md`, `_gates.json`, `_validation_report.json`, `_relentless_config.json`.
-- **Circuit breaker** — orchestrator stops after 3 remediation loops if error count isn't decreasing.
-- **Fail fast, fail cheap** — preflight catches environment issues in 30 seconds before the pipeline burns budget.
+- **Fresh context per phase.** Each phase runs in an isolated subagent. No accumulated drift from prior phases.
+- **No agent judges its own output.** Implementer doesn't validate. Validator doesn't fix. Remediator doesn't verify. This prevents self-reinforcing errors.
+- **Artifacts on disk are the only persistence.** `_relentless_state.md`, `_gates.json`, `_validation_report.json`, `_relentless_config.json`. If it's not on disk, it doesn't survive.
+- **Circuit breaker.** The orchestrator stops after 3 remediation loops if error count isn't decreasing. Prevents infinite fix-break cycles.
+- **Fail fast, fail cheap.** Preflight catches environment issues in 30 seconds. A $0 check saves $10+ of wasted pipeline execution.
 
-## Exit codes
+## Autoresearch engine
 
-| Code | Meaning |
-|------|---------|
-| 0 | Task completed successfully |
-| 1 | Max sessions exhausted without completion |
-| 2 | Escalation — stuck, looping, or unresolvable blocker |
+The `bin/autoresearch-engine` script optimizes the system prompt template through automated experimentation:
+
+```bash
+# Run baseline only
+autoresearch-engine --baseline-only --timeout 8
+
+# Full optimization loop (5 experiments)
+autoresearch-engine --max-experiments 5
+
+# Dry run — show config without executing
+autoresearch-engine --dry-run
+```
+
+It runs relentless on canonical test tasks, scores the output artifacts against 5 binary evals, mutates the system prompt template, and keeps mutations that improve the score. Results are logged to `autoresearch-results/`.
+
+### Evals
+
+| Eval | What it checks |
+|------|---------------|
+| `state_file_initialized` | State file exists with a valid `STATUS:` line |
+| `handoff_json_valid` | Handoff JSON parses with all 15 required keys |
+| `task_completed` | `STATUS: COMPLETE` in state + `success: true` in handoff |
+| `step_logging` | At least one `[STEP]` entry in state file |
+| `discoveries_populated` | Non-empty discoveries for tasks that require them |
+
+### Test tasks
+
+| Task | What it exercises |
+|------|------------------|
+| `refactor-module` | Create Python module + tests + run + report (4 phases, 10+ tool calls) |
+| `analyze-and-report` | Read + analyze + write report with cross-task dependency |
+| `iterative-fix` | Create buggy code → test → discover failure → fix → verify |
 
 ## Requirements
 
 - Python 3.11+
 - [uv](https://github.com/astral-sh/uv)
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI (`claude`)
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI
 - Anthropic API key (set `ANTHROPIC_API_KEY` or configure via `claude`)
 
 ## License
