@@ -8,7 +8,7 @@ user-invocable: true
 
 Autonomous improvement engine that combines relentless's fresh-context auto-continuation with autoresearch's hypothesis-driven mutation loop. Three modes, one core loop: **Observe → Evaluate → Hypothesize → Improve → Verify → Repeat.**
 
-Each iteration runs as a fresh relentless CLI session. The state file (`_improve_state.json`) is the sole thread of continuity between experiments. No context drift. No accumulated bias.
+Each iteration runs as a fresh relentless CLI session. The progress file (`_progress.md`) is the sole thread of continuity between experiments — plain markdown with "Work Done" and "Work to Do Next" sections. No context drift. No accumulated bias.
 
 ---
 
@@ -27,16 +27,47 @@ Parse the user's invocation:
 Every invocation starts the same way:
 
 ```bash
-cat _improve_results/_improve_state.json 2>/dev/null || echo "NO_STATE"
+cat _improve_results/_progress.md 2>/dev/null || echo "NO_STATE"
 ```
 
-**If state exists and status=running:** Resume from the last completed experiment. Tell the user: "Resuming from experiment {N}. Best score so far: {best_pass_rate}%."
+**If progress file exists and Status line says `running`:** Read the "Work Done" section to see completed experiments and the "Work to Do Next" section for the pending hypothesis. Resume from there. Tell the user: "Resuming from experiment {N}. Best score so far: {best_pass_rate}%."
 
-**If state exists and status=complete or plateau:** Ask: "Previous run finished at {best_pass_rate}%. Start fresh or review results?"
+**If progress file exists and Status line says `complete` or `plateau`:** Ask: "Previous run finished at {best_pass_rate}%. Start fresh or review results?"
 
-**If no state:** Proceed to mode-specific context gathering.
+**If no progress file:** Proceed to mode-specific context gathering.
 
 This is the unified recovery pattern — same for all modes, no special codepaths.
+
+---
+
+## progress file format
+
+The `_progress.md` file is the sole thread of continuity. Plain markdown, not JSON.
+
+```markdown
+# Progress: relentless-improve ({mode})
+## Status: running | complete | plateau
+## Target: {path or description}
+## Best: {score}/{max} ({pass_rate}%) at experiment {N}
+
+## Config
+- Mode: {app|prd|self}
+- Evals: {list}
+- Budget: {N or unlimited}
+
+## Work Done
+- exp 1: [keep] Added error boundaries — score 3/5 (60%)
+- exp 2: [discard] Tried pagination — no improvement
+- exp 3: [keep] Fixed responsive layout — score 4/5 (80%)
+
+## Work to Do Next
+- Next hypothesis: API error responses need structured error codes
+- Evals still failing: API health, lint errors
+- Plateau counter: 1/3
+```
+
+**Why markdown, not JSON:**
+No schema parsing, no nested object traversal. The "Work Done" list is the experiment history. The "Work to Do Next" section is the handoff instruction. That is the entire contract.
 
 ---
 
@@ -543,39 +574,21 @@ either fixed or marked as persistent. Only report genuinely NEW findings.
 
 **Continuous loop state tracking:**
 
-The state file tracks discovery cycles alongside experiments:
+The progress file tracks discovery cycles as flat markdown under an "Autonomous Discovery" heading:
 
-```json
-{
-  "autonomous": {
-    "check_in_interval": "none",
-    "discovery_cycle": 2,
-    "total_opportunities_found": 12,
-    "opportunities_resolved": 8,
-    "opportunities_persistent": 2,
-    "opportunities_remaining": 2,
-    "cycles": [
-      {
-        "cycle": 1,
-        "opportunities_found": 8,
-        "opportunities_resolved": 6,
-        "opportunities_persistent": 1,
-        "opportunities_skipped": 1,
-        "experiments_run": 8,
-        "experiments_kept": 6
-      },
-      {
-        "cycle": 2,
-        "opportunities_found": 4,
-        "opportunities_resolved": 2,
-        "opportunities_persistent": 1,
-        "opportunities_remaining": 1,
-        "experiments_run": 3,
-        "experiments_kept": 2
-      }
-    ]
-  }
-}
+```markdown
+## Autonomous Discovery
+- Check-in: none
+- Current cycle: 2
+- Total opportunities: 12 found, 8 resolved, 2 persistent, 2 remaining
+
+### Cycle 1
+- Opportunities: 8 found, 6 resolved, 1 persistent, 1 skipped
+- Experiments: 8 run, 6 kept
+
+### Cycle 2
+- Opportunities: 4 found, 2 resolved, 1 persistent, 1 remaining
+- Experiments: 3 run, 2 kept
 ```
 
 User can replace or extend eval presets. Max 6 evals per preset (autonomous mode adds its guardrail evals on top).
@@ -880,7 +893,7 @@ Once context is gathered and evals are defined, this loop runs identically for a
 ### setup
 
 1. Create `_improve_results/` directory
-2. Initialize `_improve_state.json` with mode, target, evals, empty experiments array
+2. Initialize `_improve_results/_progress.md` with mode, target, evals, empty Work Done section
 3. Generate `_improve_results/dashboard.html` (see dashboard section)
 4. Initialize `_improve_results/results.json` with empty experiment list
 5. Open dashboard: `open _improve_results/dashboard.html`
@@ -892,7 +905,7 @@ Run the mode-specific baseline:
 - **PRD:** Score the PRD structure against evals. No implementation yet.
 - **Self:** Read existing CLAUDE.md rules and memory. Score current coverage.
 
-Score against all evals. Record in state file and results.json. Update dashboard.
+Score against all evals. Record in _progress.md and results.json. Update dashboard.
 
 **If baseline >= 95%:** Ask user "Baseline is already at {score}%. Continue optimization?"
 
@@ -903,7 +916,7 @@ NEVER STOP. Run autonomously until a stopping condition is met.
 
 for experiment_num in 1, 2, 3, ...:
 
-    1. READ STATE: Read _improve_state.json
+    1. READ PROGRESS: Read _improve_results/_progress.md
 
     2. ANALYZE: Look at which evals are failing most.
        Read actual failing artifacts from the last experiment.
@@ -944,7 +957,7 @@ for experiment_num in 1, 2, 3, ...:
            plateau_counter += 1
            → Delete worktree (app/prd modes)
 
-    9. UPDATE STATE: Write to _improve_state.json
+    9. UPDATE PROGRESS: Rewrite _improve_results/_progress.md
 
     10. UPDATE DASHBOARD: Write to _improve_results/results.json
 
@@ -1054,7 +1067,7 @@ After each experiment:
   - pass_rate >= 95% and plateau_counter >= 2 (diminishing returns)
 ```
 
-On stop, update state status to `"complete"` or `"plateau"` and proceed to results delivery.
+On stop, update `_progress.md` Status line to `complete` or `plateau` and proceed to results delivery.
 
 ---
 
@@ -1070,7 +1083,7 @@ When the loop stops (any stopping condition), present:
 6. **Artifacts location:**
    ```
    _improve_results/
-   ├── _improve_state.json    # Full state
+   ├── _progress.md           # Handoff state (Work Done / Work to Do Next)
    ├── results.json           # Dashboard data
    ├── dashboard.html         # Open to review
    ├── changelog.md           # Every experiment logged
