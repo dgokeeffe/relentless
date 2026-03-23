@@ -54,7 +54,9 @@ NOT bug fixing — that's what `relentless-remediate` does. This is **strategic 
 4. Find lint commands: `ruff check` (Python), `npx eslint .` (JS), or ask user
 5. Ask user: "What's the focus? (general / ui-polish / performance / accessibility / data-integration / autonomous / or describe your own)"
 6. Ask user: "Budget cap? (max experiments, default: no cap)"
-7. If autonomous: ask user "How often should I check in? (every N experiments, default: 3)"
+7. If autonomous: ask user "Check-in frequency? (every N experiments / none — default: none)"
+   - `none` = fully autonomous, runs until nothing left to improve or budget hit
+   - A number = pauses every N experiments to show progress and ask to continue
 
 Select eval preset based on focus area. User can always customize.
 
@@ -409,35 +411,41 @@ IMPORTANT: Do NOT modify any files. This is a read-only exploration.
 Write ONLY to _improve_results/discovery.json and _improve_results/discovery/ (screenshots).
 ```
 
-**Phase 2: User approval gate**
+**Phase 2: Continuous improvement loop**
 
-Present the discovery report to the user:
+After discovery, the agent works through opportunities automatically, then re-discovers to find more. This is the full autonomous cycle:
 
 ```
-## Discovery Report
-
-Found {N} improvement opportunities across {categories}.
-
-### High priority
-1. [OPP-1] Dashboard table overflows on mobile (ui, small effort, low risk)
-2. [OPP-2] API errors show raw stack traces (error-handling, medium effort, low risk)
-
-### Medium priority
-3. [OPP-3] No pagination on estimates list (performance, medium effort, medium risk)
-4. [OPP-4] Missing loading skeletons (ui, small effort, low risk)
-
-### Low priority
-5. [OPP-5] 3 unused imports in utils.ts (code-quality, tiny effort, zero risk)
-6. [OPP-6] No dark mode support (ui, large effort, low risk)
-
-Which should I work on? (all / high-only / pick by number / skip)
+CYCLE:
+  1. DISCOVER — explore app, find opportunities, prioritize
+  2. IMPROVE  — work through opportunities (high priority, low risk first)
+  3. RE-DISCOVER — explore again post-improvements, find NEW opportunities
+  4. REPEAT until:
+     - Re-discovery finds zero new opportunities (app is clean)
+     - Budget cap hit
+     - Plateau: two consecutive discovery cycles find the same issues
 ```
 
-The user selects which opportunities to pursue. **No code changes happen without this approval.**
+If `check_in_interval` is set (not `none`), pause every N experiments and show progress. Otherwise run fully autonomously — the guardrails are the safety net, not human approval.
 
-**Phase 3: Guarded improvement loop**
+**On first discovery:** If check-in is `none`, start improving immediately. If check-in is set, present the discovery list once and ask which to pursue, then run uninterrupted until the next check-in.
 
-For each approved opportunity, run the standard experiment loop with these **mandatory safety guardrails:**
+**Re-discovery triggers** after all current opportunities are resolved (kept or skipped after failed attempts). The re-discovery session is identical to the initial discovery but produces a diff:
+- NEW opportunities (not seen before)
+- RESOLVED opportunities (previously found, now fixed)
+- PERSISTENT opportunities (still present despite attempts — skip these)
+
+**Stopping conditions for the continuous loop:**
+```
+STOP if:
+- Re-discovery finds 0 new opportunities (nothing left to improve)
+- Two consecutive discovery cycles find identical opportunity sets (plateau)
+- Budget cap reached (total experiments across all cycles)
+- All remaining opportunities are high-risk and check_in=none
+  (high risk ALWAYS requires user confirmation, even in continuous mode)
+```
+
+**Mandatory safety guardrails (always active, cannot be disabled):**
 
 ```
 SAFETY GUARDRAILS (always active in autonomous mode):
@@ -460,25 +468,33 @@ GUARDRAIL 4: Scope boundary
   Each experiment touches ONE opportunity. Do not "while I'm here" fix
   adjacent things. One hypothesis, one change, one eval.
 
-GUARDRAIL 5: Periodic check-in
-  Every {check_in_interval} experiments (default: 3), PAUSE and report
-  progress to the user:
+GUARDRAIL 5: Periodic check-in (optional)
+  If check_in_interval is set (not "none"):
+    Every {check_in_interval} experiments, PAUSE and report progress:
 
-  "Completed {N} experiments. {kept} kept, {discarded} discarded.
-   Score: {baseline}% → {current}%.
-   Changes made so far:
-   - OPP-1: Fixed (dashboard table now responsive)
-   - OPP-2: Fixed (error boundary added for API errors)
-   - OPP-3: In progress (next experiment)
-   Continue? (yes / stop / skip to next opportunity)"
+    "Completed {N} experiments. {kept} kept, {discarded} discarded.
+     Opportunities resolved: {resolved_count}/{total_found}.
+     Changes made:
+     - OPP-1: Fixed (dashboard table now responsive)
+     - OPP-2: Fixed (error boundary added)
+     - OPP-3: In progress
+     Continue? (yes / stop / skip to next opportunity)"
 
-  Wait for user response before continuing.
+    Wait for user response before continuing.
+
+  If check_in_interval is "none":
+    No pausing. Run fully autonomously. Log progress to
+    _improve_results/progress.md after each experiment so the user
+    can check status anytime by reading the file.
 
 GUARDRAIL 6: Risk-aware ordering
   Work through opportunities in this order:
   1. Low risk, high priority first (safest wins)
   2. Medium risk only after low-risk opportunities exhausted
-  3. High risk opportunities require explicit user confirmation per-experiment
+  3. High risk opportunities ALWAYS require explicit user confirmation,
+     even in continuous/no-check-in mode. This is the ONE exception
+     to fully autonomous operation — high risk changes are never auto-applied.
+     If no user is available, skip the high-risk opportunity and continue.
 ```
 
 **Autonomous mode evals are dynamic** — each opportunity has its own eval (from `proposed_eval` in the discovery report), PLUS the universal regression guardrails always apply.
@@ -492,6 +508,75 @@ EVAL 4: Visual regression — no unrelated routes changed?
 ```
 
 This means the max score per experiment = 4. An experiment must score 4/4 to be kept. Any regression = instant discard, even if the improvement itself worked.
+
+**Re-discovery session prompt (used after all current opportunities are resolved):**
+
+```
+You are running RE-DISCOVERY for relentless-improve (autonomous mode).
+Project root: {project_root}
+Discovery cycle: {cycle_number}
+
+This is NOT the first discovery. Previous discoveries found and resolved:
+{resolved_opportunities_summary}
+
+Opportunities that persisted despite attempts (SKIP these):
+{persistent_opportunities}
+
+YOUR TASK: Explore the app again with fresh eyes. The codebase has changed
+since last discovery. Look for:
+1. NEW issues introduced by recent improvements
+2. Issues that are NOW visible because other issues were fixed
+3. Deeper quality issues that weren't obvious before
+4. Integration issues between the improvements that were made
+
+Use the same exploration process as initial discovery.
+Compare against the discovery baseline screenshots in _improve_results/discovery/.
+
+Write to _improve_results/rediscovery_{cycle_number}.json with:
+- new_opportunities: issues not seen in any prior discovery
+- resolved: issues from prior discovery that are now fixed
+- persistent: issues that still exist despite prior attempts
+
+IMPORTANT: Do NOT re-report opportunities that were already found and
+either fixed or marked as persistent. Only report genuinely NEW findings.
+```
+
+**Continuous loop state tracking:**
+
+The state file tracks discovery cycles alongside experiments:
+
+```json
+{
+  "autonomous": {
+    "check_in_interval": "none",
+    "discovery_cycle": 2,
+    "total_opportunities_found": 12,
+    "opportunities_resolved": 8,
+    "opportunities_persistent": 2,
+    "opportunities_remaining": 2,
+    "cycles": [
+      {
+        "cycle": 1,
+        "opportunities_found": 8,
+        "opportunities_resolved": 6,
+        "opportunities_persistent": 1,
+        "opportunities_skipped": 1,
+        "experiments_run": 8,
+        "experiments_kept": 6
+      },
+      {
+        "cycle": 2,
+        "opportunities_found": 4,
+        "opportunities_resolved": 2,
+        "opportunities_persistent": 1,
+        "opportunities_remaining": 1,
+        "experiments_run": 3,
+        "experiments_kept": 2
+      }
+    ]
+  }
+}
+```
 
 User can replace or extend eval presets. Max 6 evals per preset (autonomous mode adds its guardrail evals on top).
 
