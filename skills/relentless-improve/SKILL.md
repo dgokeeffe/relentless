@@ -52,8 +52,9 @@ NOT bug fixing — that's what `relentless-remediate` does. This is **strategic 
 2. Detect stack: check for `backend/`, `frontend/`, `pyproject.toml`, `package.json`
 3. Find test commands: `uv run pytest` (Python), `npm test` (JS), or ask user
 4. Find lint commands: `ruff check` (Python), `npx eslint .` (JS), or ask user
-5. Ask user: "What's the focus? (general / ui-polish / or describe your own)"
+5. Ask user: "What's the focus? (general / ui-polish / performance / accessibility / data-integration / autonomous / or describe your own)"
 6. Ask user: "Budget cap? (max experiments, default: no cap)"
+7. If autonomous: ask user "How often should I check in? (every N experiments, default: 3)"
 
 Select eval preset based on focus area. User can always customize.
 
@@ -312,7 +313,187 @@ Fail: Any text is too small to read or has poor contrast against its background
 How to check: evaluate_script to get computed font-size and color/background of all text elements
 ```
 
-User can replace or extend eval presets. Max 6 evals.
+#### preset: autonomous
+
+The agent decides what to improve. Most powerful mode, but needs layered safety.
+
+**How it works: two phases.**
+
+**Phase 1: Discovery (read-only — ZERO code changes)**
+
+A dedicated relentless session explores the app without modifying anything. It:
+
+1. Reads the codebase structure, key files, README, package.json/pyproject.toml
+2. Runs all existing tests — records pass/fail counts
+3. Runs the app and navigates every route via Chrome DevTools
+4. Takes screenshots of every page at 1280px and 768px
+5. Checks console errors, network failures, accessibility (lighthouse_audit)
+6. Reads code quality: looks for anti-patterns, TODO comments, error handling gaps, dead code
+7. Checks performance: page load times, API response times, bundle sizes
+
+From all of this, it produces a **discovery report** — a prioritized list of improvement opportunities:
+
+```json
+{
+  "discovery_timestamp": "ISO-8601",
+  "app_summary": "Brief description of what the app does",
+  "existing_test_count": 42,
+  "existing_test_pass_rate": 95.2,
+  "routes_found": ["/", "/dashboard", "/settings"],
+  "screenshots": ["discovery/route_home_1280.png", ...],
+  "opportunities": [
+    {
+      "id": "OPP-1",
+      "priority": "high",
+      "category": "ui",
+      "title": "Dashboard table overflows container on mobile",
+      "description": "The demand plan table has no responsive handling — content clips at <900px",
+      "evidence": "screenshot discovery/route_dashboard_768.png shows horizontal overflow",
+      "proposed_eval": "No horizontal overflow on any route at 768px width",
+      "estimated_effort": "small",
+      "risk": "low"
+    },
+    {
+      "id": "OPP-2",
+      "priority": "high",
+      "category": "error-handling",
+      "title": "API errors show raw stack traces to user",
+      "description": "When /api/estimates returns 500, the frontend renders the raw error object instead of a friendly message",
+      "evidence": "Simulated error via evaluate_script — screenshot shows JSON blob",
+      "proposed_eval": "All API error responses produce user-friendly UI, never raw JSON/stack traces",
+      "estimated_effort": "medium",
+      "risk": "low"
+    },
+    {
+      "id": "OPP-3",
+      "priority": "medium",
+      "category": "performance",
+      "title": "Estimates list loads 500+ records without pagination",
+      "description": "GET /api/estimates returns all records. Slow on large datasets and causes browser jank",
+      "proposed_eval": "API supports pagination and frontend uses it, initial load <100 records",
+      "estimated_effort": "medium",
+      "risk": "medium"
+    }
+  ]
+}
+```
+
+The discovery session prompt:
+
+```
+You are running the DISCOVERY phase of relentless-improve (autonomous mode).
+Project root: {project_root}
+
+YOUR TASK: Explore this app thoroughly and identify improvement opportunities.
+You must NOT modify any code. Read-only exploration only.
+
+Steps:
+1. Read project structure: key files, README, config, package.json/pyproject.toml
+2. Run existing tests: {test_commands} — record results
+3. Start the app and explore via Chrome DevTools:
+   - navigate_page to every route you can find
+   - take_screenshot at 1280x800 and 768x1024 for each route
+   - list_console_messages — record all errors
+   - list_network_requests — record all failures
+   - lighthouse_audit for accessibility and performance scores
+4. Read source code looking for:
+   - Error handling gaps (unhandled promise rejections, missing try/catch)
+   - UI issues (hardcoded widths, missing responsive breakpoints, no loading states)
+   - Performance issues (N+1 queries, missing pagination, large bundles)
+   - Code quality (dead code, TODO comments, duplicated logic)
+   - Security issues (XSS vectors, missing input validation, exposed secrets)
+5. Prioritize by: impact (high/medium/low) × effort (small/medium/large)
+6. Write discovery report to _improve_results/discovery.json
+
+IMPORTANT: Do NOT modify any files. This is a read-only exploration.
+Write ONLY to _improve_results/discovery.json and _improve_results/discovery/ (screenshots).
+```
+
+**Phase 2: User approval gate**
+
+Present the discovery report to the user:
+
+```
+## Discovery Report
+
+Found {N} improvement opportunities across {categories}.
+
+### High priority
+1. [OPP-1] Dashboard table overflows on mobile (ui, small effort, low risk)
+2. [OPP-2] API errors show raw stack traces (error-handling, medium effort, low risk)
+
+### Medium priority
+3. [OPP-3] No pagination on estimates list (performance, medium effort, medium risk)
+4. [OPP-4] Missing loading skeletons (ui, small effort, low risk)
+
+### Low priority
+5. [OPP-5] 3 unused imports in utils.ts (code-quality, tiny effort, zero risk)
+6. [OPP-6] No dark mode support (ui, large effort, low risk)
+
+Which should I work on? (all / high-only / pick by number / skip)
+```
+
+The user selects which opportunities to pursue. **No code changes happen without this approval.**
+
+**Phase 3: Guarded improvement loop**
+
+For each approved opportunity, run the standard experiment loop with these **mandatory safety guardrails:**
+
+```
+SAFETY GUARDRAILS (always active in autonomous mode):
+
+GUARDRAIL 1: Regression gate (hard block)
+  Before scoring any experiment, run ALL existing tests: {test_commands}
+  If any previously-passing test now fails → DISCARD immediately.
+  No exceptions. No "the test was flaky." Discard and move on.
+
+GUARDRAIL 2: Screenshot regression check
+  Compare after-screenshots with discovery-phase screenshots for ALL routes,
+  not just the route being improved. If any UNRELATED route looks different
+  (layout shift, missing elements, broken styling) → DISCARD.
+
+GUARDRAIL 3: Console error ceiling
+  Count console errors after change. If the count is HIGHER than discovery
+  baseline → DISCARD. Improvements must not introduce new errors anywhere.
+
+GUARDRAIL 4: Scope boundary
+  Each experiment touches ONE opportunity. Do not "while I'm here" fix
+  adjacent things. One hypothesis, one change, one eval.
+
+GUARDRAIL 5: Periodic check-in
+  Every {check_in_interval} experiments (default: 3), PAUSE and report
+  progress to the user:
+
+  "Completed {N} experiments. {kept} kept, {discarded} discarded.
+   Score: {baseline}% → {current}%.
+   Changes made so far:
+   - OPP-1: Fixed (dashboard table now responsive)
+   - OPP-2: Fixed (error boundary added for API errors)
+   - OPP-3: In progress (next experiment)
+   Continue? (yes / stop / skip to next opportunity)"
+
+  Wait for user response before continuing.
+
+GUARDRAIL 6: Risk-aware ordering
+  Work through opportunities in this order:
+  1. Low risk, high priority first (safest wins)
+  2. Medium risk only after low-risk opportunities exhausted
+  3. High risk opportunities require explicit user confirmation per-experiment
+```
+
+**Autonomous mode evals are dynamic** — each opportunity has its own eval (from `proposed_eval` in the discovery report), PLUS the universal regression guardrails always apply.
+
+Effective eval suite per experiment in autonomous mode:
+```
+EVAL 1: (from opportunity) — does the specific improvement work?
+EVAL 2: Regression gate — all existing tests still pass?
+EVAL 3: Console ceiling — no new console errors introduced?
+EVAL 4: Visual regression — no unrelated routes changed?
+```
+
+This means the max score per experiment = 4. An experiment must score 4/4 to be kept. Any regression = instant discard, even if the improvement itself worked.
+
+User can replace or extend eval presets. Max 6 evals per preset (autonomous mode adds its guardrail evals on top).
 
 ### what each relentless session does
 
