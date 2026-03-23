@@ -52,10 +52,16 @@ NOT bug fixing — that's what `relentless-remediate` does. This is **strategic 
 2. Detect stack: check for `backend/`, `frontend/`, `pyproject.toml`, `package.json`
 3. Find test commands: `uv run pytest` (Python), `npm test` (JS), or ask user
 4. Find lint commands: `ruff check` (Python), `npx eslint .` (JS), or ask user
-5. Ask user: "Any specific quality goals? (or I'll use defaults)"
+5. Ask user: "What's the focus? (general / ui-polish / or describe your own)"
 6. Ask user: "Budget cap? (max experiments, default: no cap)"
 
-### default evals
+Select eval preset based on focus area. User can always customize.
+
+### eval presets
+
+#### preset: general (default)
+
+For functional correctness, code quality, and basic stability.
 
 ```
 EVAL 1: Zero test failures
@@ -84,7 +90,68 @@ Pass: Linter exits with code 0
 Fail: Any lint error (warnings are OK)
 ```
 
-User can replace or extend these. Max 6 evals.
+#### preset: ui-polish
+
+For visual refinement — overflow, layout, responsive design, data display, and design consistency. Uses Chrome DevTools MCP heavily.
+
+```
+EVAL 1: No horizontal overflow
+Question: Does any page have a horizontal scrollbar at the default viewport width?
+Pass: evaluate_script returns false for: document.documentElement.scrollWidth > document.documentElement.clientWidth
+Fail: Any page has horizontal overflow
+How to check: For each route, navigate_page → evaluate_script("document.documentElement.scrollWidth > document.documentElement.clientWidth")
+
+EVAL 2: No clipped or truncated content
+Question: Are there elements where text or content is visually cut off by overflow:hidden?
+Pass: No elements have scrollHeight significantly larger than clientHeight (>20px difference) among visible text containers
+Fail: Any visible text container has clipped content
+How to check: evaluate_script to find all elements matching "p, span, td, li, h1, h2, h3, h4, div" where el.scrollHeight > el.clientHeight + 20 and getComputedStyle(el).overflow !== 'visible'
+
+EVAL 3: Responsive layout integrity
+Question: Does the layout work without overlap or breakage at both 1280px and 768px widths?
+Pass: At both viewport widths — no horizontal overflow, no overlapping elements, all navigation accessible
+Fail: Layout breaks at either width
+How to check: resize_page to 1280x800 → take_screenshot → check overflow eval. Then resize_page to 768x1024 → take_screenshot → check overflow eval. Compare screenshots for obvious breakage.
+
+EVAL 4: Data tables and lists render correctly
+Question: Do all data-driven components (tables, lists, cards) show real data from the API — not empty states, loading spinners stuck, or error messages?
+Pass: Every data component shows populated content. No "No data", "Loading...", "Error", or empty table bodies visible after page load completes.
+Fail: Any data component shows empty/error/stuck-loading state
+How to check: navigate_page → wait_for("table, [class*=list], [class*=card]") → take_screenshot → evaluate_script to check that tables have >0 rows, lists have >0 items
+
+EVAL 5: No overlapping elements
+Question: Are there any elements that visually overlap each other (z-index conflicts, absolute positioning errors, margin collapse)?
+Pass: No unintentional element overlap detected
+Fail: Any elements overlap that shouldn't
+How to check: evaluate_script to get bounding rects of major layout elements (nav, main, sidebar, footer, modals) and check for intersection. Also take_screenshot and check visually.
+
+EVAL 6: Console and network clean
+Question: Is the app free of console errors AND failed network requests?
+Pass: Zero console errors AND zero network requests with status >= 400
+Fail: Any console error or failed network request
+How to check: list_console_messages (filter level=error) AND list_network_requests (filter status >= 400)
+```
+
+**UI-polish hypothesis generation strategy:**
+
+When analyzing failing evals, map to CSS/layout fix categories:
+
+| Failing Eval | Hypothesis Category | Example Fix |
+|---|---|---|
+| Horizontal overflow | Container width / flex/grid layout | "Main content area uses fixed width — switch to max-width with overflow-x handling" |
+| Clipped content | overflow:hidden on wrong container | "Card components clip long descriptions — add text-overflow: ellipsis or expand height" |
+| Responsive breakage | Missing media queries / rigid layouts | "Sidebar doesn't collapse on mobile — add responsive breakpoint at 768px" |
+| Empty data components | Loading state / API integration | "Table renders before API response arrives — add loading skeleton and data-ready check" |
+| Overlapping elements | z-index / positioning / margin | "Modal backdrop doesn't cover the sidebar — fix z-index stacking context" |
+| Console/network errors | Runtime bugs affecting rendering | "Failed API call causes component to render error state instead of data" |
+
+**Each relentless session for ui-polish MUST:**
+1. Use Chrome DevTools MCP tools directly: `navigate_page`, `take_screenshot`, `evaluate_script`, `resize_page`, `list_console_messages`, `list_network_requests`
+2. Take before/after screenshots for every change
+3. Test at BOTH 1280px and 768px viewports
+4. Save all screenshots to `_improve_results/exp_{N:03d}/screenshots/`
+
+User can replace or extend eval presets. Max 6 evals.
 
 ### what each relentless session does
 
@@ -122,6 +189,30 @@ Project root: {project_root}
 - Strategic improvement, not bug patching. Think about WHY things break, not just WHAT broke.
 - Do not refactor broadly. One hypothesis, one change.
 - If the hypothesis doesn't apply (e.g., the app already handles this case), write that in summary.json and exit.
+```
+
+**For ui-polish preset**, the session prompt adds:
+
+```
+## UI-Polish specific instructions
+Focus: {focus_area}
+Eval preset: ui-polish
+
+You MUST use Chrome DevTools MCP tools directly for evaluation:
+1. navigate_page to each route in the app
+2. take_screenshot BEFORE making any changes (save to exp_{N:03d}/screenshots/before/)
+3. evaluate_script to check for overflow, clipped content, overlapping elements
+4. resize_page to 768x1024 and take_screenshot to check responsive layout
+5. list_console_messages and list_network_requests for error checking
+6. After implementing your change, take_screenshot AFTER (save to exp_{N:03d}/screenshots/after/)
+7. Re-run all evaluate_script checks to verify improvement
+
+Your eval artifact output MUST include:
+- screenshots/before/*.png — every route at 1280px and 768px BEFORE changes
+- screenshots/after/*.png — every route at 1280px and 768px AFTER changes
+- overflow_check.json — result of overflow evaluate_script per route
+- responsive_check.json — result of responsive checks at both viewport sizes
+- console_network.json — console errors and failed network requests
 ```
 
 ### git worktree strategy (keep/discard)
