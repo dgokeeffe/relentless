@@ -151,6 +151,167 @@ When analyzing failing evals, map to CSS/layout fix categories:
 3. Test at BOTH 1280px and 768px viewports
 4. Save all screenshots to `_improve_results/exp_{N:03d}/screenshots/`
 
+#### preset: performance
+
+For response times, rendering speed, bundle size, and resource efficiency.
+
+```
+EVAL 1: API response time
+Question: Do all API endpoints respond in under 1 second?
+Pass: Every endpoint returns within 1000ms
+Fail: Any endpoint takes >1000ms
+How to check: list_network_requests → filter API calls → check timing field
+
+EVAL 2: Page load time
+Question: Does the initial page load complete (DOMContentLoaded) in under 3 seconds?
+Pass: DOMContentLoaded fires within 3000ms
+Fail: Takes longer than 3000ms
+How to check: evaluate_script("performance.timing.domContentLoadedEventEnd - performance.timing.navigationStart")
+
+EVAL 3: No large bundle warnings
+Question: Is the JavaScript bundle under 500KB (gzipped)?
+Pass: No chunk exceeds 500KB gzipped
+Fail: Any chunk over threshold
+How to check: list_network_requests → filter JS files → check transfer size
+
+EVAL 4: No unnecessary re-renders
+Question: Are there zero React/framework "too many re-renders" warnings in the console?
+Pass: No re-render warnings
+Fail: Any re-render or performance warning in console
+How to check: list_console_messages → filter for "re-render", "Maximum update depth", "performance"
+
+EVAL 5: Smooth interactions
+Question: Do click/form interactions respond within 200ms (no visible lag)?
+Pass: UI updates within 200ms of user action
+Fail: Any interaction feels sluggish or takes >200ms to update
+How to check: click element → evaluate_script timestamp before/after → check delta
+```
+
+#### preset: accessibility
+
+For WCAG compliance, keyboard navigation, screen reader support, and color contrast.
+
+```
+EVAL 1: No accessibility violations
+Question: Does the page pass a Lighthouse accessibility audit with score >= 90?
+Pass: Lighthouse accessibility score >= 90
+Fail: Score < 90
+How to check: lighthouse_audit with categories=["accessibility"]
+
+EVAL 2: All images have alt text
+Question: Do all <img> elements have non-empty alt attributes?
+Pass: Every img has alt text
+Fail: Any img missing alt
+How to check: evaluate_script("document.querySelectorAll('img:not([alt]), img[alt=\"\"]').length === 0")
+
+EVAL 3: Keyboard navigation works
+Question: Can all interactive elements (buttons, links, inputs) be reached via Tab key?
+Pass: Tab order visits all interactive elements without getting stuck
+Fail: Any interactive element unreachable via keyboard
+How to check: evaluate_script to count focusable elements, then press_key Tab repeatedly and track focus movement
+
+EVAL 4: Color contrast sufficient
+Question: Do all text elements meet WCAG AA contrast ratio (4.5:1 for normal text, 3:1 for large)?
+Pass: All text passes contrast requirements
+Fail: Any text below minimum contrast
+How to check: lighthouse_audit → extract contrast violations from results
+
+EVAL 5: Form labels present
+Question: Do all form inputs have associated <label> elements or aria-label attributes?
+Pass: Every input has a label
+Fail: Any input without label association
+How to check: evaluate_script("document.querySelectorAll('input:not([aria-label]):not([id]), select:not([aria-label]):not([id])').length") and check for matching labels
+```
+
+#### preset: data-integration
+
+For backend-frontend data flow — API contracts, error states, loading states, and data consistency.
+
+```
+EVAL 1: All API endpoints return valid JSON
+Question: Do all API endpoints return properly structured JSON responses?
+Pass: Every endpoint returns parseable JSON with expected schema
+Fail: Any endpoint returns malformed JSON, HTML error pages, or unexpected schema
+How to check: list_network_requests → filter API calls → evaluate response content-type and body
+
+EVAL 2: Error states handled gracefully
+Question: When an API returns an error (4xx/5xx), does the UI show a user-friendly message instead of crashing?
+Pass: Error responses produce clear UI feedback (toast, error boundary, message)
+Fail: App crashes, shows raw error, or silently fails
+How to check: evaluate_script to intercept fetch and return error → take_screenshot → check for error UI
+
+EVAL 3: Loading states present
+Question: Do data-dependent components show a loading indicator before data arrives?
+Pass: Every async data component shows a spinner/skeleton before content
+Fail: Any component shows empty/blank state during load
+How to check: navigate_page → take_screenshot immediately (before data loads) → check for loading indicators
+
+EVAL 4: Data consistency
+Question: Does the data displayed in the frontend match what the API returns?
+Pass: Counts, values, and labels in the UI match API response payloads
+Fail: Any mismatch between API data and rendered content
+How to check: list_network_requests → capture API response → evaluate_script to read DOM values → compare
+
+EVAL 5: Pagination/filtering works
+Question: Do filters, search, and pagination update the displayed data correctly?
+Pass: Applying filter/search/page change updates the view with correct data
+Fail: Stale data, wrong results, or no update
+How to check: fill filter input → click → list_network_requests for new API call → take_screenshot → verify data changed
+```
+
+#### preset: custom
+
+When the user describes a specific focus area (e.g., "improve the quality of architecture diagrams"), build custom evals dynamically.
+
+**Process for custom preset:**
+
+1. Ask the user: "Describe what 'good' looks like for your specific use case."
+2. From their description, extract 4-6 binary yes/no quality checks
+3. For each check, determine the Chrome DevTools verification method:
+   - Visual output quality → `take_screenshot` + `evaluate_script` to inspect rendered elements
+   - Generated content → `evaluate_script` to read DOM content
+   - File output → check file exists and validate structure
+   - API output → `list_network_requests` to capture response
+4. Present the proposed evals to the user for confirmation before starting
+5. Proceed with the standard experiment loop
+
+**Example: "improve architecture diagrams generated by nano banana pro"**
+
+User says: "My app uses nano banana pro to draw architecture diagrams. The diagrams sometimes have overlapping labels, the connections between nodes are hard to follow, and the layout doesn't use space efficiently."
+
+Generated custom evals:
+```
+EVAL 1: No overlapping labels
+Question: Are all node labels fully visible and non-overlapping in the rendered diagram?
+Pass: No text elements overlap other text or node boundaries
+Fail: Any label overlaps another label or is partially hidden behind a node
+How to check: take_screenshot of rendered diagram → evaluate_script to get bounding rects of all text/label elements → check for intersection
+
+EVAL 2: Connection paths are traceable
+Question: Can every connection between nodes be visually followed from source to target without ambiguity?
+Pass: All edges/arrows have clear paths, arrowheads visible, no crossing ambiguity
+Fail: Edges overlap in confusing ways or arrowheads are hidden
+How to check: take_screenshot → evaluate_script to count edge elements and verify each has distinct path data
+
+EVAL 3: Space utilization
+Question: Does the diagram use the available canvas area efficiently (no large empty regions while nodes are cramped)?
+Pass: Nodes are distributed across the canvas with consistent spacing
+Fail: Nodes bunched in one corner or area while >40% of canvas is empty
+How to check: evaluate_script to get all node positions → calculate bounding box vs canvas size → check distribution
+
+EVAL 4: Diagram renders without errors
+Question: Does the diagram render completely with zero console errors?
+Pass: Canvas/SVG renders fully, no errors in console
+Fail: Rendering errors, missing elements, or console exceptions
+How to check: navigate_page → wait_for(diagram container) → list_console_messages → take_screenshot
+
+EVAL 5: Text is legible
+Question: Are all labels, annotations, and titles readable at the default zoom level?
+Pass: All text elements have font size >= 12px and sufficient contrast
+Fail: Any text is too small to read or has poor contrast against its background
+How to check: evaluate_script to get computed font-size and color/background of all text elements
+```
+
 User can replace or extend eval presets. Max 6 evals.
 
 ### what each relentless session does
